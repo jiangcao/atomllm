@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This project trains a GPT-style autoregressive LLM to generate amorphous atomic structures (HfO2, SiO2, HfSiO4). The pipeline has three stages:
 
-1. **Data generation** (`mace_melt_quench.py`) — Generates amorphous structures via melt-quench molecular dynamics using the MACE-MP-0 universal potential
+1. **Data generation** (`batch_melt_quench.py`, `batched_md.py`) — Generates amorphous structures via melt-quench molecular dynamics using the MACE-MP-0 universal potential; many runs are batched into one MACE call per MD step (`--batch_size`, default 32)
 2. **Tokenization** (`atomic_tokenizer.py`) — Converts ASE Atoms objects into discrete token sequences using cluster-growing order and discretized relative displacements
 3. **Training & generation** (`train_llm.py`) — Trains a small GPT (AtomicGPT) on tokenized sequences and generates new structures
 
@@ -14,9 +14,9 @@ This project trains a GPT-style autoregressive LLM to generate amorphous atomic 
 
 ```bash
 # Step 1: Generate training data (slow — runs MD simulations)
-python mace_melt_quench.py                        # full dataset
-python mace_melt_quench.py --n_runs 5 --device cuda  # quick test on GPU
-python mace_melt_quench.py --validate             # validate existing dataset
+python batch_melt_quench.py                        # full dataset
+python batch_melt_quench.py --n_runs 5 --device cuda  # quick test on GPU
+python batch_melt_quench.py --validate             # validate existing dataset
 
 # Step 2: Tokenize structures
 python atomic_tokenizer.py --dataset data/dataset.extxyz \
@@ -45,7 +45,7 @@ Vocabulary: 4 special tokens (`[PAD]=0, [BOS]=1, [EOS]=2, [UNK]=3`) + element ty
 AtomicGPT is a standard pre-norm GPT with causal self-attention, fused QKV projections, GELU activations, and weight-tied input/output embeddings. Default: 6 layers, 256 dim, 8 heads (~2M params). Uses AdamW with cosine-warmup LR schedule.
 
 ### Data pipeline
-`mace_melt_quench.py` outputs to `data/` — individual `.extxyz` files per run in `data/structures/{composition}/`, combined dataset at `data/dataset.extxyz`, and `data/metadata.json`. The melt-quench protocol: minimize → melt (5000K) → anneal (2000K) → linear quench → equilibrate (300K), collecting snapshots throughout.
+`batch_melt_quench.py` outputs to `data/` — individual `.extxyz` files per run in `data/structures/{composition}/`, combined dataset at `data/dataset.extxyz`, and `data/metadata.json`. The melt-quench protocol: minimize → melt (5000K) → anneal (2000K) → linear quench → equilibrate (300K), collecting snapshots throughout.
 
 ## Dependencies
 
@@ -55,4 +55,4 @@ AtomicGPT is a standard pre-norm GPT with causal self-attention, fused QKV proje
 
 ## Key Configuration
 
-Tokenizer config is in `TOKENIZER_CONFIG` dict at top of `atomic_tokenizer.py`. Model hyperparameters are in `GPTConfig` dataclass in `train_llm.py`. Melt-quench parameters are in `CONFIG` dict in `mace_melt_quench.py`. Supported elements: Si, O, Hf.
+Tokenizer config is in `TOKENIZER_CONFIG` dict at top of `atomic_tokenizer.py`. Model hyperparameters are in `GPTConfig` dataclass in `train_llm.py`. Melt-quench parameters are in `CONFIG` dict in `batch_melt_quench.py`. Supported elements: Si, O, Hf.
