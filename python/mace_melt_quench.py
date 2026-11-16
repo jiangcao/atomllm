@@ -16,6 +16,7 @@ Output:
 """
 
 import os
+import zlib
 import json
 import numpy as np
 from tqdm import tqdm
@@ -30,16 +31,16 @@ from ase import units
 
 from mace.calculators import mace_mp
 
+from structure_defects import defect_summary
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
 CONFIG = {
     # Output
     "output_dir": "data",
-    "n_structures_per_composition": 200,  # per composition
-    "snapshot_interval": 50,              # save every N MD steps
+    "n_structures_per_composition": 100,  # melt-quench runs per composition
 
     # System sizes
     "n_atoms_range": (48, 96),            # randomly sample system size
@@ -56,12 +57,26 @@ CONFIG = {
     "T_anneal": 2000,   # intermediate anneal
     "T_final":  300,    # room temperature
 
-    # MD timestep and steps
-    "timestep_fs": 1.0,       # femtoseconds
-    "steps_melt":   500,      # steps at T_melt
-    "steps_anneal": 300,      # steps at T_anneal
-    "steps_quench": 500,      # steps cooling to T_final
-    "steps_final":  200,      # steps at T_final
+    # MD timestep and steps.
+    # The quench must be slow: a 0.5 ps quench (~3e15 K/s) left every SiO2
+    # structure with 3- and 5-fold Si and non-bridging O. 20 ps ≈ 8.5e13 K/s.
+    "timestep_fs": 1.0,
+    "steps_melt":    3000,
+    "steps_anneal":  3000,
+    "steps_quench": 20000,
+    "steps_final":   5000,
+
+    # Training frames (all relaxed at fixed cell with MACE; each is labelled
+    # clean/defective by structure_defects.py and the label becomes a
+    # conditioning token, so defective frames are kept as training data):
+    #   - every quench_sample_every steps once the quench is below
+    #     quench_sample_below_T (no liquid / high-T frames)
+    #   - n_final_samples evenly spaced frames during the final 300 K stage
+    "quench_sample_below_T": 1000,
+    "quench_sample_every":   1000,
+    "n_final_samples": 5,
+    "relax_fmax": 0.02,     # eV/Å
+    "relax_steps": 500,
 
     # MACE model
     "mace_model": "medium",   # "small", "medium", or "large"
@@ -162,191 +177,168 @@ def _random_positions_no_overlap(n_atoms: int, box_length: float,
 # ============================================================
 
 def run_melt_quench(atoms: Atoms, calculator, config: dict,
-                    label: str = "") -> list[Atoms]:
+                    label: str = "") -> tuple[list[Atoms], list[dict]]:
     """
-    Run full melt-quench MD protocol and collect structure snapshots.
+    Melt-quench and return relaxed frames, each labelled clean or defective.
 
     Protocol:
         1. Energy minimization (remove worst clashes)
-        2. Heat to T_melt (randomize structure)
-        3. Anneal at T_anneal
-        4. Quench to T_final
-        5. Equilibrate at T_final
+        2. Melt at T_melt, anneal at T_anneal
+        3. Linear quench to T_final, sampling frames below quench_sample_below_T
+        4. Equilibrate at T_final, sampling n_final_samples frames
+
+    Every sampled frame is relaxed (fixed cell). Liquid / high-T frames are
+    never returned: their density and bond angles are wrong, not just their
+    coordination.
 
     Returns:
-        List of ASE Atoms snapshots
+        (frames, sample_log); frames carry info["defect_free"] and
+        info["n_defects"].
     """
     atoms.calc = calculator
-    snapshots = []
-
-    def collect_snapshot(step_label):
-        """Save a copy of current structure with metadata."""
-        snap = atoms.copy()
-        snap.info["step_label"] = step_label
-        snap.info["label"] = label
-        snap.info["energy"] = atoms.get_potential_energy()
-        snap.info["energy_per_atom"] = atoms.get_potential_energy() / len(atoms)
-        snap.arrays["forces"] = atoms.get_forces().copy()
-        snapshots.append(snap)
-
-    # ---- Stage 1: Quick energy minimization ----
-    optimizer = FIRE(atoms, logfile=None)
-    optimizer.run(fmax=1.0, steps=50)   # loose convergence — just remove bad overlaps
-    collect_snapshot("minimized")
-
     dt = config["timestep_fs"] * units.fs
     friction = 0.02   # Langevin friction coefficient
+    frames, log = [], []
 
-    # ---- Stage 2: Melt at T_melt ----
+    def sample(step_label):
+        frame = atoms.copy()
+        frame.calc = calculator
+        FIRE(frame, logfile=None).run(fmax=config["relax_fmax"],
+                                      steps=config["relax_steps"])
+        defects = defect_summary(frame)
+        e = frame.get_potential_energy()
+        log.append({"step_label": step_label, "energy_per_atom": e / len(frame),
+                    "defects": dict(defects)})
+        out = frame.copy()          # drops the calculator
+        out.info.update({"label": label, "step_label": step_label,
+                         "energy": e, "energy_per_atom": e / len(frame),
+                         "defect_free": not defects,
+                         "n_defects": sum(defects.values())})
+        out.arrays["forces"] = frame.get_forces().copy()
+        frames.append(out)
+
+    FIRE(atoms, logfile=None).run(fmax=1.0, steps=50)
+
     MaxwellBoltzmannDistribution(atoms, temperature_K=config["T_melt"])
-    dyn_melt = Langevin(atoms, dt, temperature_K=config["T_melt"],
-                        friction=friction, logfile=None)
+    Langevin(atoms, dt, temperature_K=config["T_melt"],
+             friction=friction, logfile=None).run(config["steps_melt"])
+    Langevin(atoms, dt, temperature_K=config["T_anneal"],
+             friction=friction, logfile=None).run(config["steps_anneal"])
 
-    interval = config["snapshot_interval"]
-    for step in range(config["steps_melt"]):
-        dyn_melt.run(1)
-        if step % interval == 0:
-            collect_snapshot(f"melt_{step}")
-
-    # ---- Stage 3: Anneal at T_anneal ----
-    dyn_anneal = Langevin(atoms, dt, temperature_K=config["T_anneal"],
-                          friction=friction, logfile=None)
-    for step in range(config["steps_anneal"]):
-        dyn_anneal.run(1)
-        if step % interval == 0:
-            collect_snapshot(f"anneal_{step}")
-
-    # ---- Stage 4: Quench to T_final (linear cooling) ----
-    T_start = config["T_anneal"]
-    T_end = config["T_final"]
+    # Linear quench: update the thermostat target in blocks of 100 steps
+    T_start, T_end = config["T_anneal"], config["T_final"]
     steps_q = config["steps_quench"]
+    dyn_q = Langevin(atoms, dt, temperature_K=T_start,
+                     friction=friction, logfile=None)
+    block = 100
+    every = config["quench_sample_every"]
+    for s in range(0, steps_q, block):
+        T_now = T_start + (T_end - T_start) * s / steps_q
+        dyn_q.set_temperature(temperature_K=T_now)
+        dyn_q.run(min(block, steps_q - s))
+        if (s + block) % every == 0 and T_now < config["quench_sample_below_T"]:
+            sample(f"quench_{s + block}_T{int(T_now)}")
 
-    for step in range(steps_q):
-        T_current = T_start + (T_end - T_start) * step / steps_q
-        dyn_q = Langevin(atoms, dt, temperature_K=T_current,
-                         friction=friction, logfile=None)
-        dyn_q.run(1)
-        if step % interval == 0:
-            collect_snapshot(f"quench_{step}_T{int(T_current)}")
+    # Equilibrate at T_final and sample relaxed frames
+    dyn_f = Langevin(atoms, dt, temperature_K=T_end,
+                     friction=friction, logfile=None)
+    n_samp = config["n_final_samples"]
+    chunk = config["steps_final"] // n_samp
+    for k in range(n_samp):
+        dyn_f.run(chunk)
+        sample(f"final_{k}")
 
-    # ---- Stage 5: Equilibrate at T_final ----
-    dyn_final = Langevin(atoms, dt, temperature_K=config["T_final"],
-                         friction=friction, logfile=None)
-    for step in range(config["steps_final"]):
-        dyn_final.run(1)
-        if step % interval == 0:
-            collect_snapshot(f"final_{step}")
-
-    return snapshots
+    return frames, log
 
 
 # ============================================================
 # DATASET GENERATION
 # ============================================================
 
-def generate_dataset(config: dict):
+def _composition_by_name(config: dict, name: str) -> dict:
+    return next(c for c in config["compositions"] if c["name"] == name)
+
+
+def generate_dataset(config: dict, worker: int = 0, n_workers: int = 1):
     """
-    Main function: generate amorphous structure dataset for all compositions.
+    Run melt-quench for every (composition, run index) assigned to this
+    worker (round-robin), writing one .extxyz (clean frames) + one .json
+    (sample log) per run under data/structures/<comp>/. Runs whose .json
+    already exists are skipped, so jobs can be restarted. Combine with
+    merge_dataset() afterwards.
     """
-    # Setup output directories
+    struct_dir = Path(config["output_dir"]) / "structures"
+
+    print(f"[worker {worker}/{n_workers}] loading MACE-MP-0 ({config['mace_model']}) "
+          f"on {config['device']}")
+    calculator = mace_mp(model=config["mace_model"], device=config["device"],
+                         default_dtype="float32")
+
+    jobs = [(c["name"], i) for c in config["compositions"]
+            for i in range(config["n_structures_per_composition"])]
+    jobs = jobs[worker::n_workers]
+
+    for comp_name, run_idx in tqdm(jobs, desc=f"worker {worker}"):
+        comp = _composition_by_name(config, comp_name)
+        comp_dir = struct_dir / comp_name
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        if list(comp_dir.glob(f"{comp_name}_run{run_idx:04d}_N*.json")):
+            continue
+
+        rng_seed = (zlib.crc32(comp_name.encode()) % 10_000) * 100_000 + run_idx
+        np.random.seed(rng_seed)
+        # Whole formula units only: off-stoichiometry forces defects
+        fu_size = sum(comp["elements"].values())
+        n_atoms = fu_size * max(1, round(np.random.randint(*config["n_atoms_range"]) / fu_size))
+        atoms = build_random_cell(comp["elements"], n_atoms, comp["density"])
+        label = f"{comp_name}_run{run_idx:04d}_N{n_atoms}"
+
+        try:
+            frames, log = run_melt_quench(atoms, calculator, config, label)
+        except Exception as e:
+            print(f"\n  Warning: run {label} failed: {e}")
+            continue
+
+        write(str(comp_dir / f"{label}.extxyz"), frames)
+        with open(comp_dir / f"{label}.json", "w") as f:
+            json.dump({"label": label, "composition": comp_name,
+                       "n_atoms": int(n_atoms), "seed": rng_seed,
+                       "n_frames": len(frames),
+                       "n_clean": sum(fr.info["defect_free"] for fr in frames),
+                       "samples": log}, f, indent=1)
+
+
+def merge_dataset(config: dict):
+    """Combine per-run labelled frames into data/dataset.extxyz + metadata.json."""
     out_dir = Path(config["output_dir"])
     struct_dir = out_dir / "structures"
-    struct_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load MACE-MP-0 calculator
-    print("Loading MACE-MP-0 calculator...")
-    calculator = mace_mp(
-        model=config["mace_model"],
-        device=config["device"],
-        default_dtype="float32"
-    )
-    print(f"  -> Model loaded on {config['device']}")
-
-    all_snapshots = []
-    metadata = []
-
+    frames, runs = [], []
     for comp in config["compositions"]:
-        comp_name = comp["name"]
-        print(f"\n{'='*50}")
-        print(f"Generating {config['n_structures_per_composition']} "
-              f"runs for {comp_name}")
-        print(f"{'='*50}")
+        for jf in sorted((struct_dir / comp["name"]).glob("*.json")):
+            with open(jf) as f:
+                meta = json.load(f)
+            runs.append(meta)
+            xyz = jf.with_suffix(".extxyz")
+            if meta["n_frames"] and xyz.exists():
+                frames.extend(read(str(xyz), index=":"))
 
-        comp_dir = struct_dir / comp_name
-        comp_dir.mkdir(exist_ok=True)
+    write(str(out_dir / "dataset.extxyz"), frames)
+    summary = {}
+    for comp in config["compositions"]:
+        rs = [r for r in runs if r["composition"] == comp["name"]]
+        summary[comp["name"]] = {
+            "runs": len(rs),
+            "sampled_frames": sum(len(r["samples"]) for r in rs),
+            "clean_frames": sum(r["n_clean"] for r in rs),
+        }
+    with open(out_dir / "metadata.json", "w") as f:
+        json.dump({"config": config, "total_structures": len(frames),
+                   "compositions": summary, "runs": runs}, f, indent=1)
 
-        for run_idx in tqdm(range(config["n_structures_per_composition"]),
-                            desc=comp_name):
-
-            # Randomize system size
-            n_atoms = np.random.randint(*config["n_atoms_range"])
-
-            # Build random starting structure
-            atoms = build_random_cell(
-                composition=comp["elements"],
-                n_atoms_total=n_atoms,
-                density=comp["density"]
-            )
-
-            label = f"{comp_name}_run{run_idx:04d}_N{n_atoms}"
-
-            try:
-                # Run melt-quench
-                snapshots = run_melt_quench(
-                    atoms=atoms,
-                    calculator=calculator,
-                    config=config,
-                    label=label
-                )
-
-                # Save individual run snapshots
-                run_file = comp_dir / f"{label}.extxyz"
-                write(str(run_file), snapshots)
-
-                all_snapshots.extend(snapshots)
-
-                metadata.append({
-                    "label": label,
-                    "composition": comp_name,
-                    "n_atoms": n_atoms,
-                    "n_snapshots": len(snapshots),
-                    "file": str(run_file),
-                })
-
-            except Exception as e:
-                print(f"\n  Warning: run {label} failed: {e}")
-                continue
-
-    # ---- Save combined dataset ----
-    print(f"\nSaving combined dataset ({len(all_snapshots)} structures)...")
-    dataset_file = out_dir / "dataset.extxyz"
-    write(str(dataset_file), all_snapshots)
-
-    # ---- Save metadata ----
-    meta_file = out_dir / "metadata.json"
-    with open(meta_file, "w") as f:
-        json.dump({
-            "config": config,
-            "total_structures": len(all_snapshots),
-            "runs": metadata,
-            "compositions": {
-                comp["name"]: sum(
-                    m["n_snapshots"] for m in metadata
-                    if m["composition"] == comp["name"]
-                )
-                for comp in config["compositions"]
-            }
-        }, f, indent=2)
-
-    print(f"\n{'='*50}")
-    print(f"Dataset generation complete!")
-    print(f"  Total structures : {len(all_snapshots)}")
-    print(f"  Dataset file     : {dataset_file}")
-    print(f"  Metadata         : {meta_file}")
-    print(f"  Structure files  : {struct_dir}")
-    print(f"{'='*50}")
-
-    return all_snapshots, metadata
+    print(f"Merged {len(frames)} labelled frames into {out_dir/'dataset.extxyz'}")
+    for name, s in summary.items():
+        print(f"  {name:7s}: {s['clean_frames']}/{s['sampled_frames']} "
+              f"sampled frames defect-free ({s['runs']} runs)")
 
 
 # ============================================================
@@ -449,12 +441,22 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate amorphous structure dataset using MACE melt-quench"
+        description="Generate defect-free amorphous training data with MACE melt-quench"
     )
     parser.add_argument("--n_runs", type=int, default=None,
                         help="Override n_structures_per_composition")
+    parser.add_argument("--compositions", nargs="+", default=None,
+                        help="Subset of compositions, e.g. SiO2 HfO2")
     parser.add_argument("--device", type=str, default=None,
                         help="Override device (cpu/cuda)")
+    parser.add_argument("--steps_quench", type=int, default=None,
+                        help="Override quench length (steps of 1 fs)")
+    parser.add_argument("--worker", type=int, default=0,
+                        help="Index of this worker (for parallel runs)")
+    parser.add_argument("--n_workers", type=int, default=1,
+                        help="Total number of parallel workers")
+    parser.add_argument("--merge", action="store_true",
+                        help="Only merge per-run files into dataset.extxyz")
     parser.add_argument("--validate", action="store_true",
                         help="Run validation on existing dataset")
     args = parser.parse_args()
@@ -463,9 +465,17 @@ if __name__ == "__main__":
         CONFIG["n_structures_per_composition"] = args.n_runs
     if args.device:
         CONFIG["device"] = args.device
+    if args.steps_quench:
+        CONFIG["steps_quench"] = args.steps_quench
+    if args.compositions:
+        CONFIG["compositions"] = [c for c in CONFIG["compositions"]
+                                  if c["name"] in args.compositions]
 
     if args.validate:
         validate_dataset_sample("data/dataset.extxyz")
+    elif args.merge:
+        merge_dataset(CONFIG)
     else:
-        snapshots, metadata = generate_dataset(CONFIG)
-        validate_dataset_sample("data/dataset.extxyz")
+        generate_dataset(CONFIG, worker=args.worker, n_workers=args.n_workers)
+        if args.n_workers == 1:
+            merge_dataset(CONFIG)

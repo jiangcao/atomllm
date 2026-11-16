@@ -54,11 +54,11 @@ from tqdm import tqdm
 @dataclass
 class GPTConfig:
     # Vocabulary
-    vocab_size:   int = 199       # matches AtomicTokenizer vocab (4 special + 3 types + 3*64 bins)
+    vocab_size:   int = 2251      # overwritten from the sequences file
     pad_token_id: int = 0
 
     # Architecture
-    max_seq_len:  int = 512       # ~128 atoms × 4 tokens each
+    max_seq_len:  int = 520       # 6 header + 128 atoms × 4 + EOS
     n_layers:     int = 6         # 6 layers for small model, 12 for larger
     n_heads:      int = 8
     d_model:      int = 256       # embedding dimension
@@ -514,83 +514,79 @@ def train(config: GPTConfig, sequences_file: str,
 
 def generate_structure(model_path: str, tokenizer_path: str,
                        composition: str = "SiO2",
-                       n_atoms: int = 60,
+                       n_atoms: int = 72,
+                       n_samples: int = 10,
+                       max_tries: int = 100,
                        temperature: float = 0.8,
+                       penalty: float = float("inf"),
+                       relax: bool = False,
                        device: str = "cpu",
                        save_to: str = "generated.extxyz"):
     """
-    Generate a new amorphous structure using the trained LLM.
+    Generate defect-free structures with the trained model.
+
+    Prompts with Q_clean and uses DefectGuide (guided_generation.py) to
+    mask clashes, overcoordination and O-O bonds at every Z token. Finished
+    structures are checked for any remaining defect (e.g. undercoordinated
+    Si = missing O) and rejected; optionally relaxed with MACE first.
 
     Args:
-        model_path     : path to checkpoint .pt file
-        tokenizer_path : path to tokenizer.json
-        composition    : "SiO2", "HfO2", or "HfSiO4"
-        n_atoms        : target number of atoms
-        temperature    : sampling temperature (0.5 = conservative, 1.0 = diverse)
-        save_to        : output extxyz file
+        composition : "SiO2", "HfO2", "HfSiO4"
+        n_atoms     : target atom count (rounded to whole formula units)
+        n_samples   : number of defect-free structures wanted
+        max_tries   : give up after this many sampled structures
+        penalty     : logit penalty for defect-creating Z bins (inf = mask)
+        relax       : relax with MACE-MP-0 (fixed cell) before the final check
     """
-    # Load tokenizer
-    import sys
-    sys.path.append(".")
+    from ase.io import write
     from atomic_tokenizer import AtomicTokenizer
+    from guided_generation import DefectGuide, guided_generate
+    from structure_defects import defect_summary
 
     tokenizer = AtomicTokenizer.load(tokenizer_path)
-
-    # Load model
     model, _ = load_checkpoint(model_path, device)
     model.eval()
 
-    # Build composition prompt
-    # Map composition to atom type sequence for priming
-    composition_prompts = {
-        "SiO2":   ["TYPE_Si", "TYPE_O", "TYPE_O"],
-        "HfO2":   ["TYPE_Hf", "TYPE_O", "TYPE_O"],
-        "HfSiO4": ["TYPE_Hf", "TYPE_Si", "TYPE_O", "TYPE_O", "TYPE_O", "TYPE_O"],
-    }
+    guide = DefectGuide(tokenizer, composition, n_atoms, penalty=penalty)
+    print(f"\nGenerating {n_samples} x {composition} {guide.counts}, "
+          f"cell {guide.L:.2f} Å, T={temperature}")
 
-    prompt_types  = composition_prompts.get(composition, ["TYPE_Si"])
-    prompt_tokens = (
-        [tokenizer.bos_id] +
-        [tokenizer.vocab.encode_token(t) for t in prompt_types]
-    )
+    calc = None
+    if relax:
+        from ase.optimize import FIRE
+        from mace.calculators import mace_mp
+        calc = mace_mp(model="medium", device=device, default_dtype="float64")
 
-    prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long).to(device)
+    kept, stats = [], {"aborted": 0, "defective": 0}
+    for attempt in range(1, max_tries + 1):
+        atoms, info = guided_generate(model, guide, temperature=temperature,
+                                      device=device)
+        if atoms is None:
+            stats["aborted"] += 1
+            continue
+        if calc is not None:
+            atoms.calc = calc
+            FIRE(atoms, logfile=None).run(fmax=0.02, steps=500)
+            atoms.info["energy_per_atom"] = atoms.get_potential_energy() / len(atoms)
+            atoms.calc = None
+        defects = defect_summary(atoms)
+        if defects:
+            stats["defective"] += 1
+            print(f"  try {attempt}: rejected, defects {dict(defects)}")
+            continue
+        atoms.info.update({"generated_by": "AtomicGPT", "composition": composition,
+                           "temperature": temperature, "relaxed": relax})
+        kept.append(atoms)
+        print(f"  try {attempt}: defect-free ({len(kept)}/{n_samples})")
+        if len(kept) >= n_samples:
+            break
 
-    print(f"\nGenerating {composition} structure (~{n_atoms} atoms)...")
-    print(f"  Temperature : {temperature}")
-    print(f"  Prompt      : {prompt_types}")
-
-    # Generate
-    max_tokens = n_atoms * 4 + 10  # 4 tokens per atom + buffer
-    with torch.no_grad():
-        output_ids = model.generate(
-            prompt_tensor,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_k=50,
-            eos_token_id=tokenizer.eos_id
-        )
-
-    # Decode to atoms
-    token_list = output_ids[0].tolist()
-    atoms = tokenizer.decode(token_list)
-
-    if atoms is None:
-        print("Generation failed: could not decode structure")
-        return None
-
-    print(f"  Generated   : {len(atoms)} atoms")
-    print(f"  Elements    : {set(atoms.get_chemical_symbols())}")
-
-    # Save
-    from ase.io import write
-    atoms.info["generated_by"] = "AtomicGPT"
-    atoms.info["composition"]  = composition
-    atoms.info["temperature"]  = temperature
-    write(save_to, atoms)
-    print(f"  Saved to    : {save_to}")
-
-    return atoms
+    print(f"\nKept {len(kept)} defect-free structures from {attempt} tries "
+          f"(aborted {stats['aborted']}, rejected {stats['defective']})")
+    if kept:
+        write(save_to, kept)
+        print(f"  Saved to: {save_to}")
+    return kept
 
 
 # ============================================================
@@ -618,15 +614,32 @@ if __name__ == "__main__":
                         help="Checkpoint path for generation")
     parser.add_argument("--composition", default="SiO2",
                         help="Composition for generation: SiO2, HfO2, HfSiO4")
+    parser.add_argument("--n_atoms",    type=int,   default=72)
+    parser.add_argument("--n_samples",  type=int,   default=10)
+    parser.add_argument("--max_tries",  type=int,   default=100)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--penalty",    type=float, default=float("inf"),
+                        help="Logit penalty for defect-creating tokens (inf = forbid)")
+    parser.add_argument("--relax",      action="store_true",
+                        help="Relax generated structures with MACE before the defect check")
     args = parser.parse_args()
 
     if args.generate:
         # Generation mode
         assert args.checkpoint, "Provide --checkpoint for generation"
+        device = args.device if args.device != "auto" else (
+            "cuda" if torch.cuda.is_available() else "cpu")
         generate_structure(
             model_path=args.checkpoint,
             tokenizer_path=args.tokenizer,
             composition=args.composition,
+            n_atoms=args.n_atoms,
+            n_samples=args.n_samples,
+            max_tries=args.max_tries,
+            temperature=args.temperature,
+            penalty=args.penalty,
+            relax=args.relax,
+            device=device,
             save_to=f"generated_{args.composition}.extxyz"
         )
 
@@ -650,8 +663,10 @@ if __name__ == "__main__":
 
     else:
         # Full training
+        with open(args.sequences) as f:
+            vocab_size = json.load(f)["vocab_size"]
         config = GPTConfig(
-            vocab_size=199,
+            vocab_size=vocab_size,
             n_layers=args.n_layers,
             d_model=args.d_model,
             n_heads=args.n_heads,

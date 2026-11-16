@@ -1,48 +1,39 @@
 """
 Atomic Sequence Tokenizer for Amorphous Structure LLM
 ======================================================
-Converts amorphous structures (ASE Atoms objects / extxyz files)
-into token sequences suitable for training a GPT-style LLM.
+Converts periodic atomic structures (ASE Atoms / extxyz) into token sequences
+for a GPT-style LLM, and decodes them back *exactly* (up to bin resolution).
 
-Strategy:
-    - First atom: absolute position (anchor)
-    - All subsequent atoms: relative to nearest already-placed neighbor
-    - Cluster-growing order: each new atom is nearest to existing cluster
-    - Positions encoded as discretized bins (configurable resolution)
+Sequence layout:
+    [BOS] COMP_<name> Q_<q> L_<a> L_<b> L_<c>  (TYPE_<el> X_<i> Y_<j> Z_<k>)*  [EOS]
 
-Token vocabulary:
-    Special    : [PAD], [BOS], [EOS], [UNK]
-    Atom types : TYPE_Si, TYPE_O, TYPE_Hf
-    Coordinates: X_0..X_N, Y_0..Y_N, Z_0..Z_N  (relative, discretized)
-    Distance   : DIST_0..DIST_N                  (to nearest neighbor)
+    COMP_<name> : composition label (SiO2, HfO2, HfSiO4, Si, mixed)
+    Q_<q>       : Q_clean (no coordination defects) or Q_defect. Training uses
+                  both; generation is prompted with Q_clean (conditioning).
+    L_<n>       : orthorhombic cell length a, b, c in units of cell_resolution
+    TYPE_<el>   : element
+    X/Y/Z_<i>   : fractional coordinate bin along a / b / c
 
-Each atom is encoded as 4 tokens:
-    [TYPE, X, Y, Z]  (relative displacement from nearest neighbor)
+Fractional coordinates keep periodicity: bonds that cross the cell boundary
+survive the roundtrip, so a defect-free structure decodes defect-free.
 
-Requirements:
-    pip install ase numpy tqdm
+Atoms are ordered by cluster growing with minimum-image distances (start near
+the cell centre, then repeatedly add the unplaced atom nearest to the cluster),
+so the model builds structures locally, bond by bond.
 
 Usage:
-    from atomic_tokenizer import AtomicTokenizer
-    tokenizer = AtomicTokenizer()
-    tokenizer.build_vocab()
-
-    sequences = tokenizer.encode_dataset("data/dataset.extxyz")
-    tokenizer.save("tokenizer.json")
-
-    # Later:
-    tokenizer2 = AtomicTokenizer.load("tokenizer.json")
-    tokens = tokenizer2.encode_atoms(atoms)
-    atoms  = tokenizer2.decode_tokens(tokens)
+    tokenizer = AtomicTokenizer().build_vocab()
+    ids   = tokenizer.encode(atoms)
+    atoms = tokenizer.decode(ids)
 """
 
 import json
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-from ase import Atoms
-from ase.io import read, write
 from typing import Optional
+
+import numpy as np
+from ase import Atoms
+from ase.io import read
+from tqdm import tqdm
 
 
 # ============================================================
@@ -50,22 +41,35 @@ from typing import Optional
 # ============================================================
 
 TOKENIZER_CONFIG = {
-    # Coordinate discretization
-    # Relative displacements are in range [-max_disp, +max_disp] Angstroms
-    "max_displacement": 6.0,    # Angstroms — max relative displacement per axis
-    "n_bins": 64,               # bins per axis (resolution = 2*max_disp / n_bins)
-                                # 64 bins -> 0.19 Å resolution (good enough)
+    "format": "fractional_v2",
 
-    # Supported elements
+    # Fractional coordinate bins per axis.
+    # Resolution = L / n_bins: 0.02 Å for a 10 Å cell, 0.06 Å for 30 Å.
+    "n_bins": 512,
+
+    # Orthorhombic cell lengths (Å), discretised
+    "cell_min": 5.0,
+    "cell_max": 40.0,
+    "cell_resolution": 0.05,
+
     "elements": ["Si", "O", "Hf"],
 
-    # Sequence
-    "max_atoms": 128,           # maximum atoms per structure
+    # Composition labels: name -> stoichiometric ratio
+    "compositions": {
+        "SiO2":   {"Si": 1, "O": 2},
+        "HfO2":   {"Hf": 1, "O": 2},
+        "HfSiO4": {"Hf": 1, "Si": 1, "O": 4},
+        "Si":     {"Si": 1},
+    },
+
+    # Structures with more atoms are skipped (never truncated: truncation
+    # would cut bonds and create artificial dangling bonds).
+    "max_atoms": 128,
 }
 
-# Derived resolution
-_RES = 2 * TOKENIZER_CONFIG["max_displacement"] / TOKENIZER_CONFIG["n_bins"]
-print(f"Coordinate resolution: {_RES:.3f} Å per bin")
+HEADER_LEN = 6   # [BOS], COMP, Q, L_a, L_b, L_c
+QUALITY_TOKENS = ("Q_clean", "Q_defect")
+AXES = ("X", "Y", "Z")
 
 
 # ============================================================
@@ -73,24 +77,13 @@ print(f"Coordinate resolution: {_RES:.3f} Å per bin")
 # ============================================================
 
 class Vocabulary:
-    """
-    Maps token strings <-> integer IDs.
-
-    Special tokens:
-        [PAD] = 0   padding
-        [BOS] = 1   beginning of sequence
-        [EOS] = 2   end of sequence
-        [UNK] = 3   unknown token
-    """
+    """Maps token strings <-> integer IDs. [PAD]=0 [BOS]=1 [EOS]=2 [UNK]=3."""
 
     SPECIAL_TOKENS = ["[PAD]", "[BOS]", "[EOS]", "[UNK]"]
 
     def __init__(self):
         self.token2id: dict[str, int] = {}
         self.id2token: dict[int, str] = {}
-        self._add_special_tokens()
-
-    def _add_special_tokens(self):
         for tok in self.SPECIAL_TOKENS:
             self._add(tok)
 
@@ -101,23 +94,19 @@ class Vocabulary:
             self.id2token[idx] = token
         return self.token2id[token]
 
-    def build(self, elements: list[str], n_bins: int):
-        """Build full vocabulary from elements and bin count."""
-        # Atom type tokens
-        for elem in elements:
+    def build(self, config: dict):
+        for name in list(config["compositions"]) + ["mixed"]:
+            self._add(f"COMP_{name}")
+        for q in QUALITY_TOKENS:
+            self._add(q)
+        for n in range(_n_cell_bins(config)):
+            self._add(f"L_{n}")
+        for elem in config["elements"]:
             self._add(f"TYPE_{elem}")
-
-        # Coordinate tokens: X, Y, Z each get n_bins bins
-        for axis in ["X", "Y", "Z"]:
-            for b in range(n_bins):
+        for axis in AXES:
+            for b in range(config["n_bins"]):
                 self._add(f"{axis}_{b}")
-
         print(f"Vocabulary size: {len(self.token2id)} tokens")
-        print(f"  Special  : {len(self.SPECIAL_TOKENS)}")
-        print(f"  Types    : {len(elements)}")
-        print(f"  X bins   : {n_bins}")
-        print(f"  Y bins   : {n_bins}")
-        print(f"  Z bins   : {n_bins}")
 
     def __len__(self):
         return len(self.token2id)
@@ -128,10 +117,12 @@ class Vocabulary:
     def decode_id(self, idx: int) -> str:
         return self.id2token.get(idx, "[UNK]")
 
+    def ids_with_prefix(self, prefix: str) -> list[int]:
+        return [i for t, i in self.token2id.items() if t.startswith(prefix)]
+
     def to_dict(self) -> dict:
-        return {"token2id": self.token2id, "id2token": {
-            str(k): v for k, v in self.id2token.items()
-        }}
+        return {"token2id": self.token2id,
+                "id2token": {str(k): v for k, v in self.id2token.items()}}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Vocabulary":
@@ -141,258 +132,147 @@ class Vocabulary:
         return vocab
 
 
+def _n_cell_bins(config: dict) -> int:
+    return int(round((config["cell_max"] - config["cell_min"])
+                     / config["cell_resolution"])) + 1
+
+
 # ============================================================
-# CLUSTER-GROWING SEQUENCE ORDERING
+# HELPERS
 # ============================================================
+
+def composition_label(atoms: Atoms, config: dict) -> str:
+    """Match the structure's stoichiometry to a known composition label."""
+    syms = atoms.get_chemical_symbols()
+    counts = {e: syms.count(e) for e in set(syms)}
+    for name, ratio in config["compositions"].items():
+        if set(ratio) != set(counts):
+            continue
+        k = counts[next(iter(ratio))] / ratio[next(iter(ratio))]
+        if all(abs(counts[e] - k * r) < 1e-6 for e, r in ratio.items()):
+            return name
+    return "mixed"
+
+
+def cell_lengths_orthorhombic(atoms: Atoms) -> np.ndarray:
+    cell = np.asarray(atoms.get_cell())
+    off_diag = cell - np.diag(np.diag(cell))
+    if np.abs(off_diag).max() > 1e-6:
+        raise ValueError("only orthorhombic cells are supported")
+    return np.diag(cell).copy()
+
 
 def cluster_growing_order(atoms: Atoms) -> list[int]:
     """
-    Reorder atoms in cluster-growing sequence:
-        1. Start with atom closest to centroid
-        2. At each step, add atom nearest to existing cluster
-
-    This matches the autoregressive generation strategy exactly.
-
-    Returns:
-        List of atom indices in cluster-growing order
+    Cluster-growing order with minimum-image distances: start with the atom
+    nearest the cell centre, then repeatedly add the unplaced atom that is
+    nearest to any placed atom.
     """
-    positions = atoms.get_positions()
-    n = len(positions)
-
+    n = len(atoms)
     if n == 0:
         return []
-    if n == 1:
-        return [0]
+    frac = atoms.get_scaled_positions(wrap=True)
+    cell = np.asarray(atoms.get_cell())
 
-    # Start with atom nearest to centroid
-    centroid = positions.mean(axis=0)
-    dists_to_centroid = np.linalg.norm(positions - centroid, axis=1)
-    start_idx = int(np.argmin(dists_to_centroid))
+    def mic_dist(i_frac, others_frac):
+        d = others_frac - i_frac
+        d -= np.round(d)
+        return np.linalg.norm(d @ cell, axis=1)
 
-    ordered = [start_idx]
-    remaining = set(range(n)) - {start_idx}
+    start = int(np.argmin(mic_dist(np.full(3, 0.5), frac)))
+    order = [start]
+    placed = np.zeros(n, dtype=bool)
+    placed[start] = True
+    min_d = mic_dist(frac[start], frac)
+    min_d[start] = np.inf
 
-    while remaining:
-        # Positions of already-placed atoms
-        placed_pos = positions[ordered]  # shape (k, 3)
-
-        # For each remaining atom, find distance to nearest placed atom
-        best_idx = None
-        best_dist = np.inf
-
-        remaining_list = list(remaining)
-        remaining_pos = positions[remaining_list]  # shape (m, 3)
-
-        # Vectorized: distance from each remaining to each placed
-        # Shape: (m, k)
-        diffs = remaining_pos[:, None, :] - placed_pos[None, :, :]  # (m, k, 3)
-        dists = np.linalg.norm(diffs, axis=2)                        # (m, k)
-        min_dists = dists.min(axis=1)                                 # (m,)
-
-        nearest = int(np.argmin(min_dists))
-        best_idx = remaining_list[nearest]
-
-        ordered.append(best_idx)
-        remaining.remove(best_idx)
-
-    return ordered
+    for _ in range(n - 1):
+        nxt = int(np.argmin(np.where(placed, np.inf, min_d)))
+        order.append(nxt)
+        placed[nxt] = True
+        min_d = np.minimum(min_d, mic_dist(frac[nxt], frac))
+    return order
 
 
 # ============================================================
-# ENCODING (atoms -> tokens)
+# ENCODING / DECODING
 # ============================================================
 
-def discretize_displacement(disp: float, max_disp: float, n_bins: int) -> int:
-    """
-    Map a continuous displacement [-max_disp, +max_disp] to bin index [0, n_bins-1].
-    Clips out-of-range values to boundary bins.
-    """
-    # Shift to [0, 2*max_disp], then scale to [0, n_bins]
-    normalized = (disp + max_disp) / (2 * max_disp)
-    bin_idx = int(np.floor(normalized * n_bins))
-    return np.clip(bin_idx, 0, n_bins - 1)
+def encode_atoms(atoms: Atoms, vocab: Vocabulary, config: dict,
+                 add_special: bool = True) -> list[int]:
+    """Encode an orthorhombic periodic structure into token IDs."""
+    from structure_defects import find_defects
+    if len(atoms) > config["max_atoms"]:
+        raise ValueError(f"{len(atoms)} atoms > max_atoms={config['max_atoms']}")
 
+    lengths = cell_lengths_orthorhombic(atoms)
+    n_cell = _n_cell_bins(config)
+    n_bins = config["n_bins"]
 
-def undiscretize_displacement(bin_idx: int, max_disp: float, n_bins: int) -> float:
-    """
-    Map bin index back to displacement (bin center value).
-    """
-    normalized = (bin_idx + 0.5) / n_bins
-    return normalized * 2 * max_disp - max_disp
+    ids = []
+    if add_special:
+        ids.append(vocab.encode_token("[BOS]"))
+    ids.append(vocab.encode_token(f"COMP_{composition_label(atoms, config)}"))
+    ids.append(vocab.encode_token("Q_defect" if find_defects(atoms) else "Q_clean"))
+    for L in lengths:
+        k = int(round((L - config["cell_min"]) / config["cell_resolution"]))
+        if not 0 <= k < n_cell:
+            raise ValueError(f"cell length {L:.2f} Å outside "
+                             f"[{config['cell_min']}, {config['cell_max']}]")
+        ids.append(vocab.encode_token(f"L_{k}"))
 
-
-def encode_atoms(atoms: Atoms, vocab: Vocabulary,
-                 config: dict, add_special: bool = True) -> list[int]:
-    """
-    Encode an ASE Atoms object into a list of token IDs.
-
-    Encoding per atom (4 tokens):
-        TOKEN 1: TYPE_{element}
-        TOKEN 2: X_{bin}   <- relative displacement from nearest neighbor
-        TOKEN 3: Y_{bin}
-        TOKEN 4: Z_{bin}
-
-    For the FIRST atom (anchor), displacement is relative to cell center.
-
-    Args:
-        atoms       : ASE Atoms
-        vocab       : Vocabulary object
-        config      : tokenizer config dict
-        add_special : whether to prepend [BOS] and append [EOS]
-
-    Returns:
-        List of integer token IDs
-    """
-    max_disp = config["max_displacement"]
-    n_bins   = config["n_bins"]
-    max_atoms = config["max_atoms"]
-
-    # Get cluster-growing order
-    order = cluster_growing_order(atoms)
-    order = order[:max_atoms]  # truncate if too large
-
-    positions = atoms.get_positions()
-    symbols   = atoms.get_chemical_symbols()
-    cell_center = atoms.get_cell().sum(axis=0) / 2.0
-
-    token_ids = []
+    frac = atoms.get_scaled_positions(wrap=True)
+    symbols = atoms.get_chemical_symbols()
+    for i in cluster_growing_order(atoms):
+        ids.append(vocab.encode_token(f"TYPE_{symbols[i]}"))
+        for axis, f in zip(AXES, frac[i]):
+            b = int(np.floor(f * n_bins)) % n_bins
+            ids.append(vocab.encode_token(f"{axis}_{b}"))
 
     if add_special:
-        token_ids.append(vocab.encode_token("[BOS]"))
+        ids.append(vocab.encode_token("[EOS]"))
+    return ids
 
-    for seq_idx, atom_idx in enumerate(order):
-        elem = symbols[atom_idx]
-        pos  = positions[atom_idx]
-
-        # Reference point: cell center for first atom, nearest placed atom otherwise
-        if seq_idx == 0:
-            ref = cell_center
-        else:
-            placed_positions = positions[order[:seq_idx]]
-            dists = np.linalg.norm(placed_positions - pos, axis=1)
-            ref = placed_positions[np.argmin(dists)]
-
-        displacement = pos - ref  # (dx, dy, dz)
-
-        # Encode type
-        type_token = f"TYPE_{elem}"
-        token_ids.append(vocab.encode_token(type_token))
-
-        # Encode displacement per axis
-        for axis, (axis_name, d) in enumerate(
-            zip(["X", "Y", "Z"], displacement)
-        ):
-            bin_idx = discretize_displacement(d, max_disp, n_bins)
-            token_ids.append(vocab.encode_token(f"{axis_name}_{bin_idx}"))
-
-    if add_special:
-        token_ids.append(vocab.encode_token("[EOS]"))
-
-    return token_ids
-
-
-# ============================================================
-# DECODING (tokens -> atoms)
-# ============================================================
 
 def decode_tokens(token_ids: list[int], vocab: Vocabulary,
                   config: dict) -> Optional[Atoms]:
     """
-    Decode a list of token IDs back into an ASE Atoms object.
-
-    Reconstructs positions by accumulating relative displacements
-    along the cluster-growing chain.
-
-    Args:
-        token_ids : list of integer token IDs
-        vocab     : Vocabulary object
-        config    : tokenizer config dict
-
-    Returns:
-        ASE Atoms object, or None if decoding fails
+    Decode token IDs back into a periodic Atoms object.
+    Malformed atom groups are dropped; returns None if no cell or no atoms.
     """
-    max_disp = config["max_displacement"]
-    n_bins   = config["n_bins"]
+    toks = [vocab.decode_id(i) for i in token_ids]
+    toks = [t for t in toks if t not in ("[BOS]", "[PAD]", "[UNK]")]
+    if "[EOS]" in toks:
+        toks = toks[:toks.index("[EOS]")]
 
-    # Convert IDs to token strings
-    tokens = [vocab.decode_id(i) for i in token_ids]
+    comp = None
+    if toks and toks[0].startswith("COMP_"):
+        comp = toks.pop(0)[5:]
+    if toks and toks[0] in QUALITY_TOKENS:
+        toks.pop(0)
 
-    # Strip special tokens
-    tokens = [t for t in tokens if t not in ["[BOS]", "[EOS]", "[PAD]", "[UNK]"]]
-
-    if len(tokens) % 4 != 0:
-        # Truncate to last complete atom
-        tokens = tokens[:len(tokens) - (len(tokens) % 4)]
-
-    if len(tokens) == 0:
+    if len(toks) < 3 or not all(t.startswith("L_") for t in toks[:3]):
         return None
+    lengths = [config["cell_min"] + int(t[2:]) * config["cell_resolution"]
+               for t in toks[:3]]
+    toks = toks[3:]
 
-    symbols   = []
-    positions = []
-
-    # Default box size (will be set after decoding)
-    box_length = 15.0
-
-    cell_center = np.array([box_length / 2] * 3)
-
-    for i in range(0, len(tokens), 4):
-        chunk = tokens[i:i+4]
-        if len(chunk) < 4:
-            break
-
-        type_tok, x_tok, y_tok, z_tok = chunk
-
-        # Parse element
-        if not type_tok.startswith("TYPE_"):
+    n_bins = config["n_bins"]
+    symbols, frac = [], []
+    for g in range(0, len(toks) - 3, 4):
+        t, x, y, z = toks[g:g + 4]
+        if not (t.startswith("TYPE_") and x.startswith("X_")
+                and y.startswith("Y_") and z.startswith("Z_")):
             continue
-        elem = type_tok[5:]
-        symbols.append(elem)
+        symbols.append(t[5:])
+        frac.append([(int(c.split("_")[1]) + 0.5) / n_bins for c in (x, y, z)])
 
-        # Parse displacement bins
-        try:
-            x_bin = int(x_tok.split("_")[1])
-            y_bin = int(y_tok.split("_")[1])
-            z_bin = int(z_tok.split("_")[1])
-        except (IndexError, ValueError):
-            symbols.pop()
-            continue
-
-        dx = undiscretize_displacement(x_bin, max_disp, n_bins)
-        dy = undiscretize_displacement(y_bin, max_disp, n_bins)
-        dz = undiscretize_displacement(z_bin, max_disp, n_bins)
-        displacement = np.array([dx, dy, dz])
-
-        # Reference: cell center for first atom, nearest placed for rest
-        if len(positions) == 0:
-            ref = cell_center
-        else:
-            placed = np.array(positions)
-            ref = placed[np.argmin(np.linalg.norm(
-                placed - (cell_center + displacement), axis=1
-            ))]
-
-        pos = ref + displacement
-        positions.append(pos.tolist())
-
-    if len(symbols) == 0:
+    if not symbols:
         return None
-
-    # Determine appropriate box size
-    pos_array = np.array(positions)
-    span = pos_array.max(axis=0) - pos_array.min(axis=0)
-    box_length = max(span.max() + 6.0, 10.0)  # at least 10 Å, with 3Å padding
-
-    # Center structure in box
-    pos_array -= pos_array.min(axis=0)
-    pos_array += 3.0  # 3 Å padding from edges
-
-    atoms = Atoms(
-        symbols=symbols,
-        positions=pos_array,
-        cell=[box_length, box_length, box_length],
-        pbc=True
-    )
-
+    atoms = Atoms(symbols=symbols, scaled_positions=frac,
+                  cell=lengths, pbc=True)
+    if comp:
+        atoms.info["composition"] = comp
     return atoms
 
 
@@ -401,35 +281,12 @@ def decode_tokens(token_ids: list[int], vocab: Vocabulary,
 # ============================================================
 
 class AtomicTokenizer:
-    """
-    Full tokenizer: encodes/decodes amorphous structures to/from token sequences.
-
-    Usage:
-        tokenizer = AtomicTokenizer()
-        tokenizer.build_vocab()
-
-        # Encode a dataset
-        sequences = tokenizer.encode_dataset("data/dataset.extxyz")
-
-        # Save / load
-        tokenizer.save("tokenizer.json")
-        tokenizer = AtomicTokenizer.load("tokenizer.json")
-
-        # Single structure
-        tokens = tokenizer.encode(atoms)
-        atoms  = tokenizer.decode(tokens)
-    """
-
     def __init__(self, config: dict = None):
         self.config = config or TOKENIZER_CONFIG
-        self.vocab  = Vocabulary()
+        self.vocab = Vocabulary()
 
     def build_vocab(self):
-        """Build vocabulary from config."""
-        self.vocab.build(
-            elements=self.config["elements"],
-            n_bins=self.config["n_bins"]
-        )
+        self.vocab.build(self.config)
         return self
 
     @property
@@ -448,186 +305,127 @@ class AtomicTokenizer:
     def eos_id(self) -> int:
         return self.vocab.encode_token("[EOS]")
 
+    def cell_token(self, length: float) -> int:
+        k = int(round((length - self.config["cell_min"])
+                      / self.config["cell_resolution"]))
+        k = min(max(k, 0), _n_cell_bins(self.config) - 1)
+        return self.vocab.encode_token(f"L_{k}")
+
     def encode(self, atoms: Atoms, add_special: bool = True) -> list[int]:
-        """Encode a single ASE Atoms object to token IDs."""
         return encode_atoms(atoms, self.vocab, self.config, add_special)
 
     def decode(self, token_ids: list[int]) -> Optional[Atoms]:
-        """Decode token IDs back to ASE Atoms object."""
         return decode_tokens(token_ids, self.vocab, self.config)
 
-    def encode_dataset(self, extxyz_file: str,
-                       save_to: str = None,
-                       max_structures: int = None) -> list[list[int]]:
+    def encode_dataset(self, extxyz_file: str, save_to: str = None,
+                       max_structures: int = None,
+                       clean_only: bool = False) -> list[list[int]]:
         """
-        Encode a full dataset from an extxyz file.
-
-        Args:
-            extxyz_file   : path to dataset.extxyz
-            save_to       : optional .json path to save encoded sequences
-            max_structures: limit number of structures (for testing)
-
-        Returns:
-            List of token ID sequences
+        Encode a dataset. Every structure gets a Q_clean / Q_defect token from
+        the coordination-defect check, so defective frames are still useful
+        training data. clean_only=True drops defective frames instead.
         """
+        from structure_defects import find_defects
+
         print(f"\nEncoding dataset: {extxyz_file}")
         structures = read(extxyz_file, index=":")
-
         if max_structures:
             structures = structures[:max_structures]
-
         print(f"  Structures loaded: {len(structures)}")
 
-        sequences = []
-        skipped   = 0
-        lengths   = []
-
+        sequences, lengths = [], []
+        n_clean, q_clean = 0, self.vocab.encode_token("Q_clean")
+        skipped = {"elements": 0, "defects": 0, "error": 0}
         for atoms in tqdm(structures, desc="Encoding"):
-            try:
-                # Skip unsupported elements
-                syms = set(atoms.get_chemical_symbols())
-                if not syms.issubset(set(self.config["elements"])):
-                    skipped += 1
-                    continue
-
-                token_ids = self.encode(atoms)
-                sequences.append(token_ids)
-                lengths.append(len(token_ids))
-
-            except Exception as e:
-                skipped += 1
+            if not set(atoms.get_chemical_symbols()) <= set(self.config["elements"]):
+                skipped["elements"] += 1
                 continue
+            if clean_only and find_defects(atoms):
+                skipped["defects"] += 1
+                continue
+            try:
+                ids = self.encode(atoms)
+            except ValueError:
+                skipped["error"] += 1
+                continue
+            sequences.append(ids)
+            lengths.append(len(ids))
+            n_clean += ids[2] == q_clean
 
         print(f"\nEncoding complete:")
-        print(f"  Encoded  : {len(sequences)}")
+        print(f"  Encoded  : {len(sequences)} "
+              f"({n_clean} Q_clean, {len(sequences) - n_clean} Q_defect)")
         print(f"  Skipped  : {skipped}")
         if lengths:
-            print(f"  Seq len  : min={min(lengths)}, "
-                  f"max={max(lengths)}, "
+            print(f"  Seq len  : min={min(lengths)}, max={max(lengths)}, "
                   f"mean={np.mean(lengths):.1f}")
-            print(f"  Vocab size: {self.vocab_size}")
-
         if save_to:
             self._save_sequences(sequences, save_to)
-
         return sequences
 
     def _save_sequences(self, sequences: list[list[int]], path: str):
-        """Save encoded sequences to JSON."""
-        out = {
-            "vocab_size": self.vocab_size,
-            "n_sequences": len(sequences),
-            "sequences": sequences,
-        }
         with open(path, "w") as f:
-            json.dump(out, f)
+            json.dump({"vocab_size": self.vocab_size,
+                       "n_sequences": len(sequences),
+                       "sequences": sequences}, f)
         print(f"  Sequences saved to: {path}")
 
     def save(self, path: str):
-        """Save tokenizer (vocab + config) to JSON."""
-        data = {
-            "config": self.config,
-            "vocab": self.vocab.to_dict(),
-        }
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump({"config": self.config, "vocab": self.vocab.to_dict()},
+                      f, indent=2)
         print(f"Tokenizer saved to: {path}")
 
     @classmethod
     def load(cls, path: str) -> "AtomicTokenizer":
-        """Load tokenizer from JSON."""
         with open(path) as f:
             data = json.load(f)
-        tokenizer = cls(config=data["config"])
-        tokenizer.vocab = Vocabulary.from_dict(data["vocab"])
-        print(f"Tokenizer loaded from: {path}")
-        print(f"  Vocab size: {tokenizer.vocab_size}")
-        return tokenizer
+        if data["config"].get("format") != TOKENIZER_CONFIG["format"]:
+            raise ValueError(f"{path} was made by an older tokenizer format; "
+                             "re-run atomic_tokenizer.py")
+        tok = cls(config=data["config"])
+        tok.vocab = Vocabulary.from_dict(data["vocab"])
+        print(f"Tokenizer loaded from: {path} (vocab {tok.vocab_size})")
+        return tok
 
     def roundtrip_test(self, atoms: Atoms, verbose: bool = True) -> float:
-        """
-        Encode then decode a structure and measure position error.
-        Useful for checking tokenization quality.
+        """Encode+decode; return max minimum-image position error (Å)."""
+        from structure_defects import defect_summary
 
-        Returns:
-            Mean absolute error in Angstroms
-        """
-        tokens = self.encode(atoms)
-        reconstructed = self.decode(tokens)
-
-        if reconstructed is None:
-            print("Roundtrip failed: could not decode")
-            return float("inf")
-
-        # Match atoms by order (cluster-growing order is deterministic)
-        order_orig = cluster_growing_order(atoms)
-        pos_orig = atoms.get_positions()[order_orig[:len(reconstructed)]]
-        pos_rec  = reconstructed.get_positions()
-
-        n = min(len(pos_orig), len(pos_rec))
-        mae = np.mean(np.linalg.norm(pos_orig[:n] - pos_rec[:n], axis=1))
-
+        rec = self.decode(self.encode(atoms))
+        order = cluster_growing_order(atoms)
+        d = rec.get_scaled_positions() - atoms.get_scaled_positions(wrap=True)[order]
+        d -= np.round(d)
+        err = np.linalg.norm(d @ np.asarray(rec.get_cell()), axis=1)
         if verbose:
-            print(f"\nRoundtrip test:")
-            print(f"  N atoms original    : {len(atoms)}")
-            print(f"  N atoms reconstructed: {len(reconstructed)}")
-            print(f"  Token sequence length: {len(tokens)}")
-            print(f"  Position MAE        : {mae:.4f} Å")
-            print(f"  (Expected ~{_RES/2:.3f} Å = half bin width)")
-
-        return mae
+            print(f"Roundtrip: {len(atoms)} atoms, max err {err.max():.3f} Å, "
+                  f"defects before {dict(defect_summary(atoms))} "
+                  f"after {dict(defect_summary(rec))}")
+        return float(err.max())
 
 
 # ============================================================
-# DATASET CLASS FOR LLM TRAINING
+# DATASET CLASS
 # ============================================================
 
 class AtomicSequenceDataset:
-    """
-    PyTorch-compatible dataset of tokenized atomic sequences.
-    Used directly for LLM training in the next step.
-
-    Usage:
-        dataset = AtomicSequenceDataset(sequences, max_length=512)
-        loader  = DataLoader(dataset, batch_size=32, shuffle=True)
-    """
-
-    def __init__(self, sequences: list[list[int]],
-                 max_length: int = 512,
-                 pad_id: int = 0):
-        self.sequences  = sequences
+    def __init__(self, sequences, max_length: int = 512, pad_id: int = 0):
+        self.sequences = sequences
         self.max_length = max_length
-        self.pad_id     = pad_id
+        self.pad_id = pad_id
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        """
-        Returns (input_ids, target_ids) for next-token prediction.
-        Input  = sequence[:-1]
-        Target = sequence[1:]   (shifted by 1)
-        """
-        seq = self.sequences[idx]
-
-        # Truncate
-        seq = seq[:self.max_length + 1]
-
-        # Pad to max_length + 1
+        seq = self.sequences[idx][:self.max_length + 1]
         padded = seq + [self.pad_id] * (self.max_length + 1 - len(seq))
-
-        input_ids  = padded[:-1]
-        target_ids = padded[1:]
-
-        # Return as lists (convert to tensors in collate_fn or training loop)
-        return input_ids, target_ids
+        return padded[:-1], padded[1:]
 
     @classmethod
-    def from_file(cls, sequences_file: str, **kwargs) -> "AtomicSequenceDataset":
-        """Load from saved sequences JSON."""
+    def from_file(cls, sequences_file: str, **kwargs):
         with open(sequences_file) as f:
-            data = json.load(f)
-        return cls(data["sequences"], **kwargs)
+            return cls(json.load(f)["sequences"], **kwargs)
 
 
 # ============================================================
@@ -637,44 +435,28 @@ class AtomicSequenceDataset:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Tokenize amorphous structure dataset for LLM training"
-    )
-    parser.add_argument("--dataset",   default="data/dataset.extxyz",
-                        help="Input extxyz dataset")
-    parser.add_argument("--out_tokenizer", default="data/tokenizer.json",
-                        help="Output tokenizer file")
-    parser.add_argument("--out_sequences", default="data/sequences.json",
-                        help="Output encoded sequences file")
-    parser.add_argument("--max_structures", type=int, default=None,
-                        help="Limit structures (for testing)")
-    parser.add_argument("--test_roundtrip", action="store_true",
-                        help="Run roundtrip test on first structure")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Tokenize structures for LLM training")
+    p.add_argument("--dataset", default="data/dataset.extxyz")
+    p.add_argument("--out_tokenizer", default="data/tokenizer.json")
+    p.add_argument("--out_sequences", default="data/sequences.json")
+    p.add_argument("--max_structures", type=int, default=None)
+    p.add_argument("--clean_only", action="store_true",
+                   help="Drop defective structures instead of labelling them Q_defect")
+    p.add_argument("--test_roundtrip", action="store_true",
+                   help="Roundtrip-test the first 5 structures, then exit")
+    args = p.parse_args()
 
-    # Build tokenizer
-    tokenizer = AtomicTokenizer()
-    tokenizer.build_vocab()
+    tokenizer = AtomicTokenizer().build_vocab()
 
-    # Roundtrip test on a single structure
     if args.test_roundtrip:
-        print("\nRunning roundtrip test on synthetic structure...")
-        from ase.build import bulk
-        test_atoms = read(args.dataset, index="0")
-        tokenizer.roundtrip_test(test_atoms)
+        for a in read(args.dataset, index=":5"):
+            tokenizer.roundtrip_test(a)
+        raise SystemExit
 
-    # Encode full dataset
     sequences = tokenizer.encode_dataset(
-        extxyz_file=args.dataset,
-        save_to=args.out_sequences,
-        max_structures=args.max_structures
-    )
-
-    # Save tokenizer
+        args.dataset, save_to=args.out_sequences,
+        max_structures=args.max_structures,
+        clean_only=args.clean_only)
     tokenizer.save(args.out_tokenizer)
-
-    print("\nReady for LLM training!")
-    print(f"  Vocab size : {tokenizer.vocab_size}")
-    print(f"  Sequences  : {len(sequences)}")
-    print(f"  Next step  : python train_llm.py --sequences {args.out_sequences} "
+    print(f"\nNext: python train_llm.py --sequences {args.out_sequences} "
           f"--tokenizer {args.out_tokenizer}")
