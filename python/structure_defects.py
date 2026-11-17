@@ -5,7 +5,11 @@ Used to keep interface/bulk traps out of training data and out of generated
 structures. A structure is "clean" when every atom has its ideal bonding:
 
     Si : exactly 4 neighbours from {Si, O}   (Si0 ... Si4+ suboxide states are
-         all fine, so a Si/SiO2 interface with Si-Si + Si-O bonds is allowed)
+         all fine, so a Si/SiO2 interface with Si-Si + Si-O bonds is allowed).
+         A Si-Si contact counts as a bond only when both Si have < 4 O
+         neighbours: two fully oxidised Si that share an edge (two-membered
+         ring, Si..Si ~2.3-2.45 A with MACE-MP) are not bonded and are not a
+         defect.
     O  : bonded only to cations; 2 Si if all-Si, 2..4 cations if any Hf
     Hf : 6..8 O neighbours
 
@@ -30,7 +34,7 @@ from ase.neighborlist import neighbor_list
 
 # Bond cutoffs (Å), roughly the first RDF minimum for each pair
 BOND_CUTOFFS = {
-    ("Si", "Si"): 2.45,   # Si-Si bond ~2.35; excludes edge-sharing Si..Si (~2.5)
+    ("Si", "Si"): 2.45,   # Si-Si bond ~2.35 (edge-sharing Si..Si handled in find_defects)
     ("Si", "O"):  2.10,
     ("O", "O"):   1.70,
     ("Hf", "O"):  2.70,
@@ -58,8 +62,14 @@ def find_defects(atoms: Atoms) -> list[tuple[int, str]]:
         return []
     i_idx, j_idx = neighbor_list("ij", atoms, cutoffs)
 
+    n_o = np.zeros(len(atoms), int)
+    np.add.at(n_o, i_idx[np.array(symbols)[j_idx] == "O"], 1)
+
     neigh = [[] for _ in range(len(atoms))]
     for i, j in zip(i_idx, j_idx):
+        # Si..Si next to a fully oxidised Si is edge sharing, not a bond
+        if symbols[i] == symbols[j] == "Si" and (n_o[i] >= 4 or n_o[j] >= 4):
+            continue
         neigh[i].append(symbols[j])
 
     defects = []

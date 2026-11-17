@@ -40,6 +40,7 @@ CONFIG = {
     # Output
     "output_dir": "data",
     "n_structures_per_composition": 100,  # melt-quench runs per composition
+    "run_offset": 0,          # first run index (new groups use new indices/seeds)
 
     # System sizes
     "n_atoms_range": (48, 96),            # randomly sample system size
@@ -303,7 +304,8 @@ def generate_dataset(config: dict, worker: int = 0, n_workers: int = 1):
                          default_dtype="float32")
 
     jobs = [(c["name"], i) for c in config["compositions"]
-            for i in range(config["n_structures_per_composition"])]
+            for i in range(config["run_offset"],
+                           config["run_offset"] + config["n_structures_per_composition"])]
     jobs = jobs[worker::n_workers]
     for comp in config["compositions"]:
         (struct_dir / comp["name"]).mkdir(parents=True, exist_ok=True)
@@ -357,8 +359,28 @@ def generate_dataset(config: dict, worker: int = 0, n_workers: int = 1):
               f"{len(queue)} runs left", flush=True)
 
 
+def relabel_run(frames: list, meta: dict) -> bool:
+    """
+    Recompute defect labels of a run's frames (info + json samples) with the
+    current structure_defects rules. Returns True if anything changed.
+    """
+    changed = False
+    for fr, sample in zip(frames, meta["samples"]):
+        defects = dict(defect_summary(fr))
+        if defects != sample["defects"]:
+            changed = True
+            sample["defects"] = defects
+            fr.info["defect_free"] = not defects
+            fr.info["n_defects"] = sum(defects.values())
+    meta["n_clean"] = sum(fr.info["defect_free"] for fr in frames)
+    return changed
+
+
 def merge_dataset(config: dict):
-    """Combine per-run labelled frames into data/dataset.extxyz + metadata.json."""
+    """
+    Relabel per-run frames with the current defect rules (rewriting changed
+    run files) and combine them into data/dataset.extxyz + metadata.json.
+    """
     out_dir = Path(config["output_dir"])
     struct_dir = out_dir / "structures"
     frames, runs = [], []
@@ -366,10 +388,15 @@ def merge_dataset(config: dict):
         for jf in sorted((struct_dir / comp["name"]).glob("*.json")):
             with open(jf) as f:
                 meta = json.load(f)
-            runs.append(meta)
             xyz = jf.with_suffix(".extxyz")
-            if meta["n_frames"] and xyz.exists():
-                frames.extend(read(str(xyz), index=":"))
+            run_frames = read(str(xyz), index=":") \
+                if meta["n_frames"] and xyz.exists() else []
+            if relabel_run(run_frames, meta):
+                write(str(xyz), run_frames)
+                with open(jf, "w") as f:
+                    json.dump(meta, f, indent=1)
+            runs.append(meta)
+            frames.extend(run_frames)
 
     write(str(out_dir / "dataset.extxyz"), frames)
     summary = {}
@@ -498,6 +525,13 @@ if __name__ == "__main__":
                         help="Subset of compositions, e.g. SiO2 HfO2")
     parser.add_argument("--device", type=str, default=None,
                         help="Override device (cpu/cuda)")
+    parser.add_argument("--run_offset", type=int, default=None,
+                        help="First run index, e.g. 100 for a second group "
+                             "of runs (distinct labels and seeds)")
+    parser.add_argument("--quench_sample_every", type=int, default=None,
+                        help="Steps between sampled quench frames below 1000 K")
+    parser.add_argument("--n_final_samples", type=int, default=None,
+                        help="Frames sampled in the final 300 K stage")
     parser.add_argument("--steps_quench", type=int, default=None,
                         help="Override quench length (steps of 1 fs)")
     parser.add_argument("--batch_size", type=int, default=None,
@@ -507,7 +541,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_workers", type=int, default=1,
                         help="Total number of parallel workers")
     parser.add_argument("--merge", action="store_true",
-                        help="Only merge per-run files into dataset.extxyz")
+                        help="Only relabel + merge per-run files into dataset.extxyz")
     parser.add_argument("--validate", action="store_true",
                         help="Run validation on existing dataset")
     args = parser.parse_args()
@@ -518,6 +552,9 @@ if __name__ == "__main__":
         CONFIG["device"] = args.device
     if args.batch_size:
         CONFIG["batch_size"] = args.batch_size
+    for key in ("run_offset", "quench_sample_every", "n_final_samples"):
+        if getattr(args, key) is not None:
+            CONFIG[key] = getattr(args, key)
     if args.steps_quench:
         CONFIG["steps_quench"] = args.steps_quench
     if args.compositions:
