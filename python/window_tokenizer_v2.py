@@ -66,6 +66,17 @@ WINDOW_Z_CONFIG = dict(
     n_ph=256,                          # 1.4 deg
 )
 IDEAL_CN = {"Si": 4, "O": 2, "Hf": 7}
+# per-atom defect kinds for unlikelihood targets (bit flags)
+UNDER, OVER = 1, 2
+UNDER_LABELS = {"Si_dangling", "O_nonbridging", "Hf_undercoord"}
+
+
+def defect_kinds(atoms) -> np.ndarray:
+    """Per atom: 0 clean, UNDER (missing bonds) | OVER (extra / O-O bonds)."""
+    k = np.zeros(len(atoms), int)
+    for i, lab in find_defects(atoms):
+        k[i] |= UNDER if lab in UNDER_LABELS else OVER
+    return k
 
 
 def _cut(a, b):
@@ -230,7 +241,14 @@ class WindowZTokenizer(WindowTokenizer):
         return self.pos_of_bin(self.bin_of(np.asarray(p)))
 
     # -------- encode --------
-    def encode_window(self, sym, local, levels, comp, clean, return_recon=False):
+    def encode_window(self, sym, local, levels, comp, clean, return_recon=False,
+                      kinds=None):
+        """kinds (per atom, defect_kinds codes): if given, also return the
+        unlikelihood targets: positions in ids of
+          * the [NEXT] that closes an UNDER atom (ctx or fill): the decision
+            to leave it with missing bonds
+          * the angle tokens (TH, PH) or [JUMP] X Y Z of every defective fill
+            atom: the place where it was put (R and TYPE are not blamed)."""
         sym = np.asarray(sym)
         local = np.asarray(local, float)
         known = self.is_known(local, levels)
@@ -246,6 +264,8 @@ class WindowZTokenizer(WindowTokenizer):
         state_of = {g: k for k, g in enumerate(ctx)}  # original idx -> state idx
         orig_of = list(ctx)
         unplaced = set(fill)
+        ul = []
+        bad = (lambda g: kinds is not None and kinds[g])
         while unplaced:
             f = st.focus
             if f is None:                            # jump
@@ -258,6 +278,8 @@ class WindowZTokenizer(WindowTokenizer):
                     d = np.linalg.norm(local[cand] - self.W / 2, axis=1)
                 g = cand[int(np.argmin(d))]
                 b = self.bin_of(local[g])
+                if bad(g):
+                    ul += [len(ids) + 2, len(ids) + 3, len(ids) + 4]
                 ids += [self.jump_id, self.tid(f"TYPE_{sym[g]}")]
                 ids += [self.tid(f"{a}_{int(v)}") for a, v in zip(AXES, b)]
                 state_of[g] = st.add(sym[g], self.pos_of_bin(b))
@@ -266,6 +288,8 @@ class WindowZTokenizer(WindowTokenizer):
                 continue
             kids = [g for g in nb[orig_of[f]] if g in unplaced]
             if not kids:
+                if bad(orig_of[f]) and kinds[orig_of[f]] & UNDER:
+                    ul.append(len(ids))
                 ids.append(self.next_id)
                 st.next()
                 continue
@@ -276,11 +300,15 @@ class WindowZTokenizer(WindowTokenizer):
             q = self.quantise_child(fr, local[g])
             if q is None:                            # R out of range -> jump
                 b = self.bin_of(local[g])
+                if bad(g):
+                    ul += [len(ids) + 2, len(ids) + 3, len(ids) + 4]
                 ids += [self.jump_id, self.tid(f"TYPE_{sym[g]}")]
                 ids += [self.tid(f"{a}_{int(v)}") for a, v in zip(AXES, b)]
                 state_of[g] = st.add(sym[g], self.pos_of_bin(b))
             else:
                 kr, kt, kp = q
+                if bad(g):
+                    ul += [len(ids) + 2, len(ids) + 3]
                 ids += [self.tid(f"TYPE_{sym[g]}"), self.tid(f"R_{kr}"),
                         self.tid(f"TH_{kt}"), self.tid(f"PH_{kp}")]
                 state_of[g] = st.add(sym[g], self.recon_child(fr, kr, kt, kp), parent=f)
@@ -289,6 +317,8 @@ class WindowZTokenizer(WindowTokenizer):
         ids.append(self.eos_id)
         if return_recon:
             return ids, st, orig_of
+        if kinds is not None:
+            return ids, ul
         return ids
 
     # -------- decode --------
@@ -345,27 +375,30 @@ def build_dataset(tok, frames, crops_per_frame, val_frac, max_len, seed=0,
     if isinstance(crops_per_frame, int):
         crops_per_frame = [crops_per_frame] * len(frames)
     out = {"train": [], "val": []}
+    ul_out = {"train": [], "val": []}       # unlikelihood target positions per sequence
     stats = defaultdict(int)
     for i, atoms in enumerate(tqdm(frames, desc="Cropping")):
         split = "val" if atoms.info.get("label", str(i)) in val_runs else "train"
-        defective = np.zeros(len(atoms), bool)
-        for j, _ in find_defects(atoms):
-            defective[j] = True
+        defective = defect_kinds(atoms)
         comp = composition_of(atoms)
         for _ in range(crops_per_frame[i]):
             sym, local, dfl = random_crop(atoms, tok.W, rng, defective)
             if len(sym) == 0:
                 continue
             levels = random_levels(rng, tok.config["n_known_levels"])
-            ids = tok.encode_window(sym, local, levels, comp, clean=not dfl.any())
+            ids, ul = tok.encode_window(sym, local, levels, comp, clean=not dfl.any(),
+                                        kinds=dfl)
             if len(ids) > max_len:
                 stats["too_long"] += 1
                 continue
             out[split].append(ids)
+            ul_out[split].append(ul)
+            stats["ul_targets"] += len(ul)
+            stats["ul_next"] += sum(ids[p] == tok.next_id for p in ul)
             stats["clean" if not dfl.any() else "defect"] += 1
             stats["jump"] += ids.count(tok.jump_id)
             stats["next"] += ids.count(tok.next_id)
-    return out, dict(stats), sorted(val_runs)
+    return out, ul_out, dict(stats), sorted(val_runs)
 
 
 if __name__ == "__main__":
@@ -395,7 +428,7 @@ if __name__ == "__main__":
         print(f"{path}: {len(fr)} frames, {cpf[-1]} crops/frame")
     keep = json.load(open(args.keep_val_runs))["val_runs"] if args.keep_val_runs else None
     print(f"{len(frames)} frames, window {args.window} Å, vocab {tok.vocab_size}")
-    data, stats, val_runs = build_dataset(tok, frames, cpf, args.val_frac, args.max_len,
+    data, ul, stats, val_runs = build_dataset(tok, frames, cpf, args.val_frac, args.max_len,
                                           args.seed, keep_val_runs=keep,
                                           val_prefix=args.val_prefix)
     out = Path(args.out_dir)
@@ -404,7 +437,11 @@ if __name__ == "__main__":
     lens = [len(s) for s in data["train"]]
     with open(out / "sequences.json", "w") as f:
         json.dump({"vocab_size": tok.vocab_size, "sequences": data["train"],
-                   "val_sequences": data["val"], "val_runs": val_runs}, f)
+                   "val_sequences": data["val"], "val_runs": val_runs,
+                   # unlikelihood targets (train.py --ul_weight): token positions of
+                   # defect decisions; scored with the label slot set to q_clean_id
+                   "ul_positions": ul["train"], "val_ul_positions": ul["val"],
+                   "q_pos": 2, "q_clean_id": tok.tid("Q_clean")}, f)
     print(f"train {len(data['train'])}, val {len(data['val'])} "
           f"({len(val_runs)} held-out runs); {stats}")
     print(f"seq len min {min(lens)} mean {np.mean(lens):.0f} max {max(lens)}")

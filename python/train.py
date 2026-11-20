@@ -362,6 +362,59 @@ class AtomicSequenceDataset(torch.utils.data.Dataset):
         return cls(data["sequences"], **kwargs)
 
 
+class ULSequenceDataset(AtomicSequenceDataset):
+    """Sequences + unlikelihood targets: returns (x, y, m) with m[t] = 1 when
+    the target y[t] (= token at position t + 1) is a defect decision (see
+    window_tokenizer_v2.encode_window(kinds=...))."""
+
+    def __init__(self, sequences, ul_positions, **kwargs):
+        super().__init__(sequences, **kwargs)
+        self.ul_positions = ul_positions
+
+    def __getitem__(self, idx):
+        x, y = super().__getitem__(idx)
+        m = torch.zeros(self.max_length, dtype=torch.float32)
+        for p in self.ul_positions[idx]:
+            if 1 <= p <= self.max_length:
+                m[p - 1] = 1.0
+        return x, y, m
+
+
+def unlikelihood(model, x, y, m, q_pos: int, q_clean_id: int):
+    """Unlikelihood of the marked defect decisions under the CLEAN label:
+    the rows with targets are re-scored with the label slot set to Q_clean and
+    -log(1 - p(target)) is averaged over the marked tokens. Returns
+    (loss, mean p) or (None, None) when the batch has no targets."""
+    rows = m.sum(1) > 0
+    if not rows.any():
+        return None, None
+    xt = x[rows].clone()
+    xt[:, q_pos] = q_clean_id
+    logits, _ = model(xt)
+    lp = F.log_softmax(logits.float(), dim=-1).gather(-1, y[rows].unsqueeze(-1)).squeeze(-1)
+    p = lp.exp()
+    mr = m[rows]
+    ul = -torch.log1p(-p.clamp(max=1 - 1e-6))
+    n = mr.sum()
+    return (ul * mr).sum() / n, ((p * mr).sum() / n).detach()
+
+
+@torch.no_grad()
+def evaluate_ul(model, loader, device, q_pos, q_clean_id, max_batches: int = 50):
+    """Validation: mean p of the defect decisions under the clean label."""
+    model.eval()
+    tot, n = 0.0, 0
+    for b, (x, y, m) in enumerate(loader):
+        if b >= max_batches:
+            break
+        x, y, m = x.to(device), y.to(device), m.to(device)
+        _, p = unlikelihood(model, x, y, m, q_pos, q_clean_id)
+        if p is not None:
+            tot += p.item(); n += 1
+    model.train()
+    return tot / max(n, 1)
+
+
 class SymmetryAugmenter:
     """
     Random symmetry copy of a tokenized periodic structure, done directly on
@@ -501,10 +554,10 @@ def evaluate(model: AtomicGPT, loader: DataLoader,
     total_loss = 0.0
     n_batches  = 0
 
-    for x, y in loader:
+    for batch in loader:
         if n_batches >= max_batches:
             break
-        x, y = x.to(device), y.to(device)
+        x, y = batch[0].to(device), batch[1].to(device)
         _, loss = model(x, y)
         total_loss += loss.item()
         n_batches  += 1
@@ -547,9 +600,11 @@ def load_checkpoint(path: str, device: str = "cpu"):
 def train(config: GPTConfig, sequences_file: str,
           out_dir: str = "checkpoints", device: str = "auto",
           augment_tokenizer: Optional[str] = None, num_workers: int = 0,
-          init_checkpoint: Optional[str] = None):
+          init_checkpoint: Optional[str] = None, ul_weight: float = 0.0):
     """augment_tokenizer: tokenizer.json path -> random symmetry augmentation
-    of the training split (validation stays un-augmented)."""
+    of the training split (validation stays un-augmented).
+    ul_weight > 0: add ul_weight x unlikelihood of the defect decisions of
+    defective crops re-labelled Q_clean (sequences file needs ul_positions)."""
 
     # Device
     if device == "auto":
@@ -562,7 +617,23 @@ def train(config: GPTConfig, sequences_file: str,
         sequences_file, max_length=config.max_seq_len
     )
     with open(sequences_file) as f:
-        val_seqs = json.load(f).get("val_sequences")
+        meta = json.load(f)
+    val_seqs = meta.get("val_sequences")
+    val_ul_loader = None
+    if ul_weight > 0:
+        assert "ul_positions" in meta and not augment_tokenizer, \
+            "--ul_weight needs ul_positions in the sequences file (window_tokenizer_v2.py), no --augment"
+        q_pos, q_clean_id = meta["q_pos"], meta["q_clean_id"]
+        full_dataset = ULSequenceDataset(meta["sequences"], meta["ul_positions"],
+                                         max_length=config.max_seq_len)
+        n_ul = sum(len(u) > 0 for u in meta["ul_positions"])
+        print(f"  Unlikelihood: weight {ul_weight}, {n_ul} train sequences with "
+              f"{sum(map(len, meta['ul_positions']))} targets")
+        if meta.get("val_ul_positions") and len(meta["val_ul_positions"]) == len(val_seqs):
+            val_ul_loader = DataLoader(
+                ULSequenceDataset(val_seqs, meta["val_ul_positions"], max_length=config.max_seq_len),
+                batch_size=config.batch_size, shuffle=False, num_workers=0)
+    del meta
     if val_seqs:
         # Pre-split (e.g. window crops, held out by MD run)
         train_set = full_dataset
@@ -625,11 +696,16 @@ def train(config: GPTConfig, sequences_file: str,
         epoch_loss = 0.0
         t0 = time.time()
 
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        for batch in train_loader:
+            x, y = batch[0].to(device), batch[1].to(device)
 
             # Forward
             _, loss = model(x, y)
+            ce = loss
+            if ul_weight > 0:
+                ul, p_ul = unlikelihood(model, x, y, batch[2].to(device), q_pos, q_clean_id)
+                if ul is not None:
+                    loss = loss + ul_weight * ul
 
             # Backward
             optimizer.zero_grad(set_to_none=True)
@@ -644,7 +720,9 @@ def train(config: GPTConfig, sequences_file: str,
             # Logging
             if step % config.log_every == 0:
                 lr_now = optimizer.param_groups[0]["lr"]
-                print(f"  step {step:5d} | loss {loss.item():.4f} | lr {lr_now:.2e}")
+                extra = (f" | ce {ce.item():.4f} | ul {ul.item():.4f} p {p_ul.item():.3f}"
+                         if ul_weight > 0 and ul is not None else "")
+                print(f"  step {step:5d} | loss {loss.item():.4f} | lr {lr_now:.2e}{extra}")
                 train_losses.append((step, loss.item()))
 
             # Validation
@@ -652,6 +730,9 @@ def train(config: GPTConfig, sequences_file: str,
                 val_loss = evaluate(model, val_loader, device)
                 val_losses.append((step, val_loss))
                 print(f"\n>>> Validation loss: {val_loss:.4f} (best: {best_val_loss:.4f})")
+                if val_ul_loader is not None:
+                    print(f">>> Val p(defect decision | Q_clean): "
+                          f"{evaluate_ul(model, val_ul_loader, device, q_pos, q_clean_id):.4f}")
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -800,6 +881,9 @@ if __name__ == "__main__":
                         help="Checkpoint path for generation")
     parser.add_argument("--composition", default="SiO2",
                         help="Composition for generation: SiO2, HfO2, HfSiO4")
+    parser.add_argument("--ul_weight", type=float, default=0.0,
+                        help="unlikelihood weight for defect decisions of defective crops "
+                             "re-labelled Q_clean (needs ul_positions, window_tokenizer_v2.py)")
     parser.add_argument("--init_checkpoint", default=None,
                         help="Warm start from this checkpoint (same vocab/architecture)")
     parser.add_argument("--n_atoms",    type=int,   default=72)
@@ -868,4 +952,4 @@ if __name__ == "__main__":
         train(config, args.sequences, out_dir=args.out_dir, device=args.device,
               augment_tokenizer=args.tokenizer if args.augment else None,
               num_workers=args.num_workers if args.augment else 0,
-              init_checkpoint=args.init_checkpoint)
+              init_checkpoint=args.init_checkpoint, ul_weight=args.ul_weight)
