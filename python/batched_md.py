@@ -56,6 +56,9 @@ class BatchedSystem:
         f64 = dict(dtype=torch.float64, device=self.device)
         self.batch = self.base["batch"]                                  # (n_atoms,)
         self.n_atoms = torch.bincount(self.batch, minlength=self.n_struct)
+        # atoms held fixed by MD and FIRE (e.g. a crystalline substrate);
+        # set from outside, may change during a run
+        self.frozen = torch.zeros(len(self.batch), dtype=torch.bool, device=self.device)
         self.pos = torch.tensor(
             np.concatenate([a.positions for a in self.atoms_list]), **f64)
         self.masses = torch.tensor(
@@ -189,10 +192,12 @@ class BatchedLangevin:
         for _ in range(n_steps):
             alive = (~self.failed)[s.batch][:, None]
             self.vel += 0.5 * dt * self.forces / self.m
+            self.vel[s.frozen] = 0.0
             s.pos += 0.5 * dt * self.vel * alive
             self.vel = c1 * self.vel + c2 * torch.sqrt(self.kT / self.m) * self._noise()
             self._remove_com()
             self.vel *= alive
+            self.vel[s.frozen] = 0.0
             s.pos += 0.5 * dt * self.vel
             _, self.forces = s.compute()
             self._check(self.forces)
@@ -229,6 +234,8 @@ def batched_fire(system: BatchedSystem, fmax: float, steps: int, pos=None,
     step = 0
     while True:
         energy, forces = s.compute()
+        forces = forces.clone()
+        forces[s.frozen] = 0.0
         f_norm = torch.nan_to_num(forces.norm(dim=1), nan=float("inf"))
         converged = s.per_struct_max(f_norm) < fmax
         if converged.all() or step >= steps:

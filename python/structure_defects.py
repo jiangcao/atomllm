@@ -34,7 +34,9 @@ from ase.neighborlist import neighbor_list
 
 # Bond cutoffs (Å), roughly the first RDF minimum for each pair
 BOND_CUTOFFS = {
-    ("Si", "Si"): 2.45,   # Si-Si bond ~2.35 (edge-sharing Si..Si handled in find_defects)
+    ("Si", "Si"): 2.60,   # Si-Si bond ~2.35, stretched to 2.45-2.6 at Si/SiO2 interfaces
+                          # (MACE-relaxed interface MD, 2026-11-20); edge-sharing Si..Si
+                          # handled in find_defects
     ("Si", "O"):  2.10,
     ("O", "O"):   1.70,
     ("Hf", "O"):  2.70,
@@ -52,29 +54,53 @@ def _cutoff_dict():
     return d
 
 
-def find_defects(atoms: Atoms) -> list[tuple[int, str]]:
-    """Return a list of (atom_index, defect_label) for every defective atom."""
-    symbols = atoms.get_chemical_symbols()
-    present = set(symbols)
+# Si-Si bonds shorter than this always count; stretched Si-Si contacts between
+# SI_SI_STRICT and the Si-Si bond cutoff only complete a Si up to 4 partners,
+# and only between two Si that both have < 4 partners: a stretched contact
+# can fill a dangling bond but never makes a Si overcoordinated (2026-11-20)
+SI_SI_STRICT = 2.45
+
+
+def coordination(atoms: Atoms):
+    """Per atom: (n_strict, n_eff, counts) with counts[i] = Counter of
+    bonded neighbour elements (strict bonds + accepted stretched Si-Si).
+    Si: O (< Si-O cutoff) + Si-Si (< SI_SI_STRICT) + accepted stretched Si-Si;
+    Si..Si next to a fully oxidised Si is edge sharing, not a bond."""
+    symbols = np.array(atoms.get_chemical_symbols())
+    n = len(atoms)
+    counts = [Counter() for _ in range(n)]
+    present = set(symbols.tolist())
     cutoffs = {k: v for k, v in _cutoff_dict().items()
                if k[0] in present and k[1] in present}
     if not cutoffs:
-        return []
-    i_idx, j_idx = neighbor_list("ij", atoms, cutoffs)
+        return np.zeros(n, int), np.zeros(n, int), counts
+    i_idx, j_idx, d = neighbor_list("ijd", atoms, cutoffs)
+    n_o = np.zeros(n, int)
+    np.add.at(n_o, i_idx[symbols[j_idx] == "O"], 1)
+    sisi = (symbols[i_idx] == "Si") & (symbols[j_idx] == "Si")
+    edge = sisi & ((n_o[i_idx] >= 4) | (n_o[j_idx] >= 4))
+    stretched = sisi & ~edge & (d >= SI_SI_STRICT)
+    strict = ~edge & ~stretched
+    for i, j in zip(i_idx[strict], j_idx[strict]):
+        counts[i][symbols[j]] += 1
+    n_strict = np.array([sum(c.values()) for c in counts], int)
+    # stretched Si-Si: both partners below 4, nearest first, fill up to 4
+    order = np.argsort(d[stretched])
+    si, sj = i_idx[stretched][order], j_idx[stretched][order]
+    n_eff = n_strict.copy()
+    for i, j in zip(si, sj):
+        if i < j and n_eff[i] < 4 and n_eff[j] < 4:
+            n_eff[i] += 1; n_eff[j] += 1
+            counts[i]["Si"] += 1; counts[j]["Si"] += 1
+    return n_strict, n_eff, counts
 
-    n_o = np.zeros(len(atoms), int)
-    np.add.at(n_o, i_idx[np.array(symbols)[j_idx] == "O"], 1)
 
-    neigh = [[] for _ in range(len(atoms))]
-    for i, j in zip(i_idx, j_idx):
-        # Si..Si next to a fully oxidised Si is edge sharing, not a bond
-        if symbols[i] == symbols[j] == "Si" and (n_o[i] >= 4 or n_o[j] >= 4):
-            continue
-        neigh[i].append(symbols[j])
-
+def find_defects(atoms: Atoms) -> list[tuple[int, str]]:
+    """Return a list of (atom_index, defect_label) for every defective atom."""
+    symbols = atoms.get_chemical_symbols()
+    _, _, counts = coordination(atoms)
     defects = []
-    for i, (s, nb) in enumerate(zip(symbols, neigh)):
-        c = Counter(nb)
+    for i, (s, c) in enumerate(zip(symbols, counts)):
         if s == "Si":
             cn = c["Si"] + c["O"]
             if cn < 4:

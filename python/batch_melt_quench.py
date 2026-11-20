@@ -20,6 +20,7 @@ import os
 import zlib
 import json
 import numpy as np
+import torch
 from tqdm import tqdm
 from pathlib import Path
 
@@ -89,9 +90,79 @@ CONFIG = {
 }
 
 
+# Compositions run only when named with --compositions (not by default).
+# SiO2Si: Si(001) slab / amorphous SiO2 sandwich, periodic in x, y and z (two
+# interfaces per cell). The slab is frozen while hot (it would melt), its
+# outer layers are released below T_unfreeze, its inner layers stay fixed.
+EXTRA_COMPOSITIONS = [
+    {"name": "SiO2Si", "interface": True, "elements": {"Si": 1, "O": 2},
+     "density": 2.2,               # oxide density, g/cm^3
+     "lateral_cells": 2,           # Si(001) cells along x and y (2a = 10.86 Å)
+     "slab_cells": 2,              # Si cells along z (8 atomic layers)
+     "free_layers": 2,             # outer slab layers per side released when cold
+     "oxide_thickness": (7.0, 12.0),
+     "T_unfreeze": 1300.0},
+]
+SI_A = 5.431
+
+
 # ============================================================
 # STRUCTURE BUILDER
 # ============================================================
+
+def build_interface_cell(comp: dict) -> Atoms:
+    """Si(001) slab + random oxide layer (uses np.random state). Per-atom
+    arrays: substrate, fixed_always (inner slab layers), fixed_hot (whole
+    slab, frozen above T_unfreeze)."""
+    from ase.build import bulk
+    n_l, n_z = comp["lateral_cells"], comp["slab_cells"]
+    slab = bulk("Si", "diamond", a=SI_A, cubic=True).repeat((n_l, n_l, n_z))
+    p = slab.get_positions()
+    p[:, 2] -= p[:, 2].min()
+    h = p[:, 2].max()
+    layer = np.round(p[:, 2] / (SI_A / 4)).astype(int)        # 0 .. 4*n_z-1
+    n_layers = 4 * n_z
+    k = comp["free_layers"]
+    inner = (layer >= k) & (layer < n_layers - k)
+
+    L = n_l * SI_A
+    t = np.random.uniform(*comp["oxide_thickness"])
+    gap = 0.6                                  # Å between top Si plane and oxide region
+    Lz = h + SI_A / 4 + t                      # slab bottom image sits at Lz
+    units_per_A3 = comp["density"] / (60.084 / 0.60221)
+    n_si = max(1, int(round(units_per_A3 * L * L * t)))
+    # every substrate Si-O bond needs half an extra O; top atoms of each
+    # surface have 2 dangling bonds: excess between half and all of them
+    n_top = 2 * n_l * n_l
+    lo_f, hi_f = comp.get("excess_O_frac", (0.5, 1.0))   # fraction of all top dangling bonds
+    excess = np.random.randint(int(round(lo_f * 2 * n_top)), int(round(hi_f * 2 * n_top)) + 1)
+    n_o = 2 * n_si + excess
+
+    ox = []
+    tries = 0
+    lo, hi = h + gap, Lz - gap
+    while len(ox) < n_si + n_o and tries < 200000:
+        tries += 1
+        c = np.array([np.random.uniform(0, L), np.random.uniform(0, L), np.random.uniform(lo, hi)])
+        cand = np.vstack([p] + ([np.array(ox)] if ox else []))
+        d = cand - c
+        d[:, :2] -= L * np.round(d[:, :2] / L)
+        d[:, 2] -= Lz * np.round(d[:, 2] / Lz)
+        if np.min(np.linalg.norm(d, axis=1)) > 1.5:
+            ox.append(c)
+    while len(ox) < n_si + n_o:                # fallback: overlap allowed
+        ox.append(np.array([np.random.uniform(0, L), np.random.uniform(0, L),
+                            np.random.uniform(lo, hi)]))
+    sym = ["Si"] * len(slab) + ["Si"] * n_si + ["O"] * n_o
+    atoms = Atoms(sym, positions=np.vstack([p, np.array(ox)]), cell=[L, L, Lz], pbc=True)
+    sub = np.zeros(len(atoms), bool); sub[:len(slab)] = True
+    fa = np.zeros(len(atoms), bool); fa[:len(slab)] = inner
+    atoms.new_array("substrate", sub.astype(int))
+    atoms.new_array("fixed_always", fa.astype(int))
+    atoms.new_array("fixed_hot", sub.astype(int))
+    atoms.info["T_unfreeze"] = comp["T_unfreeze"]
+    return atoms
+
 
 def build_random_cell(composition: dict, n_atoms_total: int, density: float) -> Atoms:
     """
@@ -205,6 +276,19 @@ def run_melt_quench_batch(atoms_list: list[Atoms], labels: list[str], calculator
     """
     system = BatchedSystem(atoms_list, calculator)
     n = system.n_struct
+    # optional frozen substrate (interface cells): fixed_always atoms never
+    # move, fixed_hot atoms only while the thermostat is above T_unfreeze
+    def _mask(key):
+        return torch.tensor(np.concatenate([a.arrays.get(key, np.zeros(len(a), int)).astype(bool)
+                                            for a in atoms_list]), device=system.device)
+    fixed_always, fixed_hot = _mask("fixed_always"), _mask("fixed_hot")
+    T_unfreeze = max([a.info.get("T_unfreeze", 0.0) for a in atoms_list])
+
+    def set_T(T):
+        system.frozen = fixed_always | (fixed_hot & (T > T_unfreeze))
+        dyn.set_temperature(T)
+
+    system.frozen = fixed_always | fixed_hot
     dt = config["timestep_fs"] * units.fs
     friction = 0.02   # Langevin friction coefficient (ASE units)
     frames = [[] for _ in range(n)]
@@ -214,7 +298,7 @@ def run_melt_quench_batch(atoms_list: list[Atoms], labels: list[str], calculator
     dyn = BatchedLangevin(system, dt, friction, config["T_melt"], seed=seed)
 
     total = (config["steps_melt"] + config["steps_anneal"]
-             + config["steps_quench"] + config["steps_final"])
+             + config["steps_quench"] + config["steps_final"] + config.get("hold_steps", 0))
     bar = tqdm(total=total, desc=desc, mininterval=60, unit="step")
 
     def run(n_steps):
@@ -251,7 +335,7 @@ def run_melt_quench_batch(atoms_list: list[Atoms], labels: list[str], calculator
             frames[k].append(frame)
 
     run(config["steps_melt"])
-    dyn.set_temperature(config["T_anneal"])
+    set_T(config["T_anneal"])
     run(config["steps_anneal"])
 
     # Linear quench: update the thermostat target in blocks of 100 steps
@@ -259,15 +343,23 @@ def run_melt_quench_batch(atoms_list: list[Atoms], labels: list[str], calculator
     steps_q = config["steps_quench"]
     block = 100
     every = config["quench_sample_every"]
+    hold_T, hold_steps = config.get("hold_T", 0.0), config.get("hold_steps", 0)
+    held = False
     for s in range(0, steps_q, block):
         T_now = T_start + (T_end - T_start) * s / steps_q
-        dyn.set_temperature(T_now)
+        if hold_steps and not held and T_now <= hold_T:
+            # interface anneal: hold at hold_T (substrate outer layers free
+            # when hold_T < T_unfreeze) before continuing the quench
+            set_T(hold_T)
+            run(hold_steps)
+            held = True
+        set_T(T_now)
         run(min(block, steps_q - s))
         if (s + block) % every == 0 and T_now < config["quench_sample_below_T"]:
             sample(f"quench_{s + block}_T{int(T_now)}")
 
     # Equilibrate at T_final and sample relaxed frames
-    dyn.set_temperature(T_end)
+    set_T(T_end)
     n_samp = config["n_final_samples"]
     chunk = config["steps_final"] // n_samp
     for k in range(n_samp):
@@ -327,9 +419,13 @@ def generate_dataset(config: dict, worker: int = 0, n_workers: int = 1):
                         + attempt * 10_000 + run_idx)
             np.random.seed(rng_seed)
             # Whole formula units only: off-stoichiometry forces defects
-            fu_size = sum(comp["elements"].values())
-            n_atoms = fu_size * max(1, round(np.random.randint(*config["n_atoms_range"]) / fu_size))
-            atoms_list.append(build_random_cell(comp["elements"], n_atoms, comp["density"]))
+            if comp.get("interface"):
+                atoms_list.append(build_interface_cell(comp))
+                n_atoms = len(atoms_list[-1])
+            else:
+                fu_size = sum(comp["elements"].values())
+                n_atoms = fu_size * max(1, round(np.random.randint(*config["n_atoms_range"]) / fu_size))
+                atoms_list.append(build_random_cell(comp["elements"], n_atoms, comp["density"]))
             meta.append({"label": f"{comp_name}_run{run_idx:04d}_N{n_atoms}",
                          "composition": comp_name, "n_atoms": int(n_atoms),
                          "seed": rng_seed, "attempt": attempt})
@@ -534,12 +630,21 @@ if __name__ == "__main__":
                         help="Frames sampled in the final 300 K stage")
     parser.add_argument("--steps_quench", type=int, default=None,
                         help="Override quench length (steps of 1 fs)")
+    parser.add_argument("--hold_T", type=float, default=None,
+                        help="hold the quench at this T (K) for --hold_steps (interface anneal)")
+    parser.add_argument("--hold_steps", type=int, default=None)
+    parser.add_argument("--excess_O_frac", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                        help="SiO2Si: extra O as fraction of all top-surface dangling bonds")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Runs advanced together on the GPU (default 32)")
     parser.add_argument("--worker", type=int, default=0,
                         help="Index of this worker (for parallel runs)")
     parser.add_argument("--n_workers", type=int, default=1,
                         help="Total number of parallel workers")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory (default data/)")
+    parser.add_argument("--n_atoms_range", type=int, nargs=2, default=None,
+                        metavar=("MIN", "MAX"), help="Random system size range")
     parser.add_argument("--merge", action="store_true",
                         help="Only relabel + merge per-run files into dataset.extxyz")
     parser.add_argument("--validate", action="store_true",
@@ -557,8 +662,19 @@ if __name__ == "__main__":
             CONFIG[key] = getattr(args, key)
     if args.steps_quench:
         CONFIG["steps_quench"] = args.steps_quench
+    if args.hold_T is not None:
+        CONFIG["hold_T"] = args.hold_T
+    if args.hold_steps is not None:
+        CONFIG["hold_steps"] = args.hold_steps
+    if args.excess_O_frac is not None:
+        for c in EXTRA_COMPOSITIONS:
+            c["excess_O_frac"] = tuple(args.excess_O_frac)
+    if args.output_dir:
+        CONFIG["output_dir"] = args.output_dir
+    if args.n_atoms_range:
+        CONFIG["n_atoms_range"] = tuple(args.n_atoms_range)
     if args.compositions:
-        CONFIG["compositions"] = [c for c in CONFIG["compositions"]
+        CONFIG["compositions"] = [c for c in CONFIG["compositions"] + EXTRA_COMPOSITIONS
                                   if c["name"] in args.compositions]
 
     if args.validate:
