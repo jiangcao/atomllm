@@ -39,6 +39,7 @@ from window_tokenizer import WindowTokenizer, growth_order
 MAX_BOND = max(BOND_CUTOFFS.values())
 SI_A = 5.431
 SIO2_UNITS_PER_A3 = 2.2 / (60.084 / 0.60221)
+RECORDER = None   # RL episode recorder (python/rl/recorder.py), set by window_generation_v2 --record
 
 
 class _VocabView:
@@ -619,7 +620,7 @@ def grow_surface(model, tok, args):
             n_tries += len(guides)
             stats["samples"] = stats.get("samples", 0) + len(guides)
             cands = []
-            for g, (out, info) in zip(guides, outs):
+            for gk, (g, (out, info)) in enumerate(zip(guides, outs)):
                 if out is None:
                     continue
                 s_new, p_new = g.new_atoms()
@@ -628,8 +629,10 @@ def grow_surface(model, tok, args):
                 final2 = np.concatenate([final, np.zeros(len(s_new), bool)])
                 now_final = finality(pos2)
                 c_ = dict(sym2=sym2, pos2=pos2, final2=final2, now_final=now_final,
-                          new_idx=np.arange(len(sym), len(sym2)), relaxed=False)
-                c_["bad"] = evaluate(sym2, pos2, now_final, final2)
+                          new_idx=np.arange(len(sym), len(sym2)), relaxed=False, g=gk)
+                # --one_go: accept whatever the model samples (no checks, no backtracking)
+                c_["bad"] = {} if args.one_go else evaluate(sym2, pos2, now_final, final2)
+                c_["raw_bad"] = dict(c_["bad"])
                 cands.append(c_)
             if not cands:
                 continue
@@ -667,6 +670,8 @@ def grow_surface(model, tok, args):
                         chosen = c_
                         stats["relax_rescued"] += 1
                         break
+            if RECORDER is not None:
+                RECORDER.on_try(n, t, guides, outs, cands, chosen)
             # blame: pre-existing atoms that made candidates fail
             for c_ in cands:
                 for i in c_["bad"]:
@@ -695,6 +700,8 @@ def grow_surface(model, tok, args):
                 print(f"  window {n + 1} try {t}: accepted ({len(clean)}/{len(cands)} clean raw"
                       + (", repaired" if chosen["relaxed"] else "") + ")", flush=True)
             history.append((len(sym), final.copy(), o_debt, pos.copy()))
+            if RECORDER is not None:
+                RECORDER.on_accept(len(sym), len(chosen["sym2"]))
             sym, pos = chosen["sym2"], chosen["pos2"]
             final = chosen["final2"] | chosen["now_final"]
             ok = True
@@ -733,13 +740,21 @@ def grow_surface(model, tok, args):
         if not (culprit is not None and culprit == last_culprit):
             n_pop = min(n_pop, args.max_jump)
         last_culprit = culprit
+        if RECORDER is not None:
+            # defects among already-final interior atoms of the windows about to be undone
+            fi = final & interior(pos)
+            RECORDER.before_backtrack([i for i, _ in find_defects(Atoms(sym, positions=pos, pbc=False)) if fi[i]])
         for _ in range(max(1, n_pop)):
             k, final, o_debt, pos_saved = history.pop()
+            if RECORDER is not None:
+                RECORDER.on_pop()
             n -= 1
             if not history:
                 break
         sym, pos = sym[:k], pos_saved      # positions before relaxations of undone windows
         n_back += 1
+        if RECORDER is not None:
+            RECORDER.on_backtrack(culprit, n_base)
         why = "" if culprit is None else (f" (given atom {culprit})" if culprit < n_base
                                            else f" (atom {culprit} placed there)")
         print(f"  window {n_fail} failed {args.max_tries}x: backtracking to window {n + 1}{why}",
@@ -754,11 +769,16 @@ def grow_surface(model, tok, args):
     tags = np.zeros(len(atoms), int); tags[:n_sub] = 1
     atoms.set_tags(tags)
     shift = atoms.get_positions()[0] - pos[0]
+    # growth frame (for post-processing, e.g. anneal + interior judging)
+    atoms.info.update(shift=" ".join(f"{v:.6f}" for v in shift), Lx=float(Lx), Ly=float(Ly),
+                      z_bot=float(z_bot), z1=float(z1), n_sub=int(n_sub))
     inner = interior(atoms.get_positions() - shift)
     d_in, d_out = {}, {}
     for i, lab in find_defects(atoms):
         dd = d_in if inner[i] else d_out
         dd[lab] = dd.get(lab, 0) + 1
+    if RECORDER is not None:
+        RECORDER.on_end([i for i, _ in find_defects(atoms) if inner[i]], n, len(cells), n_back)
     print(f"\nGrown {len(atoms)} atoms ({atoms.get_chemical_formula()}), "
           f"{n}/{len(cells)} windows, {n_tries} tries, {n_back} backtracks")
     print(f"  interior defects: {d_in or 'none'}")
@@ -798,6 +818,8 @@ if __name__ == "__main__":
                    help="surface: write a snapshot after every accepted window / backtrack")
     p.add_argument("--relax", action="store_true",
                    help="surface: MACE-relax new + open nearby atoms before judging a window")
+    p.add_argument("--one_go", action="store_true",
+                   help="accept the first sample of every window: no defect checks, no backtracking")
     p.add_argument("--deadend", action="store_true",
                    help="surface: reject a window at once if an open atom can no longer get a partner")
     p.add_argument("--substrate_keep_above", type=float, default=1.0,

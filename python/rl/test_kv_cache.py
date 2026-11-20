@@ -82,3 +82,15 @@ for use in (False, True):
 same = sum(a == b for a, b in zip(out[False][1], out[True][1]))
 print(f"    identical samples with / without cache: {same}/{NG} (fp differences can flip a rare draw)")
 print(f"    speed-up {out[False][2] / out[True][2]:.1f}x")
+
+# (3) fast guide mask == reference mask on random candidates around placed atoms
+nd, nt = 0, 0
+for gap in (None, {("Si", "O"): (2.10, 2.55), ("Si", "Si"): (2.60, 2.85)}):
+  wg2.GAP = gap
+  for gd in guides:
+    P = gd.frac * gd.L
+    for e in ("Si", "O"):
+        c = P[rng.integers(len(P), size=400)] + rng.normal(0, 1.5, (400, 3))
+        nd += int((gd.bad(e, c) != gd.bad_full(e, c)).sum()); nt += 400
+print(f"(3) fast vs reference guide mask: {nd}/{nt} differ")
+assert nd == 0

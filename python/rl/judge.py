@@ -30,7 +30,7 @@ def judge(pr, s_new, p_new):
     core &= ~((Dm < MAXB) & (Dp > Dm + 1e-6)).any(1)
     n_ctx = len(pr.ctx_i)
     core[n_ctx:n_ctx + len(pr.past)] = False
-    big = np.ptp(pos, axis=0).max() + 50.0
-    a = Atoms(sym, positions=pos, cell=[big] * 3, pbc=False)
+    lo = pos.min(0) - 1.0
+    a = Atoms(sym, positions=pos - lo, cell=np.ptp(pos, axis=0) + 2.0, pbc=False)
     defs = [(i, lab) for i, lab in find_defects(a) if core[i]]
     return int(core.sum()), defs

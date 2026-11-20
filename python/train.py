@@ -222,6 +222,17 @@ class AtomicGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """final (layer-normed) hidden states (B, T, d_model)"""
+        B, T = input_ids.shape
+        assert T <= self.config.max_seq_len, \
+            f"Sequence length {T} exceeds max {self.config.max_seq_len}"
+        positions = torch.arange(T, device=input_ids.device).unsqueeze(0)  # (1, T)
+        x = self.drop(self.token_emb(input_ids) + self.pos_emb(positions))
+        for block in self.blocks:
+            x = block(x)
+        return self.ln_final(x)
+
     def forward(self, input_ids: torch.Tensor,
                 targets: Optional[torch.Tensor] = None):
         """
@@ -233,18 +244,7 @@ class AtomicGPT(nn.Module):
             logits : (B, T, vocab_size)
             loss   : scalar cross-entropy loss (if targets provided)
         """
-        B, T = input_ids.shape
-        assert T <= self.config.max_seq_len, \
-            f"Sequence length {T} exceeds max {self.config.max_seq_len}"
-
-        positions = torch.arange(T, device=input_ids.device).unsqueeze(0)  # (1, T)
-
-        x = self.drop(self.token_emb(input_ids) + self.pos_emb(positions))
-
-        for block in self.blocks:
-            x = block(x)
-
-        x      = self.ln_final(x)
+        x      = self.hidden(input_ids)
         logits = self.lm_head(x)   # (B, T, vocab_size)
 
         loss = None

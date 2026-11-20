@@ -35,7 +35,9 @@ import torch.nn.functional as F
 
 import window_generation as wg
 from window_tokenizer_v2 import WindowZTokenizer, ZState
-from guided_generation import _pair, BOND_CUTOFFS
+from guided_generation import _pair, BOND_CUTOFFS, MIN_DIST, MAX_SI_CN, MAX_HF_CN
+# no cutoff / minimum distance / gap reaches further than this (Å)
+R_NEAR = max(list(BOND_CUTOFFS.values()) + list(MIN_DIST.values()) + [2.85]) + 0.05
 
 FORCE_BONDS = False
 # (1) near-miss mask: no new atom at a distance that is neither a bond nor
@@ -78,7 +80,53 @@ class ZWindowGuide(wg.WindowGuide):
         return np.all((p >= self.fill_lo) & (p < self.fill_hi), axis=-1)
 
     def bad(self, elem, p):
-        """(m,3) local Å -> bool (m,) invalid."""
+        """(m,3) local Å -> bool (m,) invalid. Same result as bad_full, but
+        only atoms within R_NEAR of the candidates' bounding box are checked."""
+        if self.period is not None:
+            return self.bad_full(elem, p)
+        out = ~self.in_box(p)
+        ok = ~out
+        if not ok.any() or not self.sym:
+            return out
+        q = p[ok]
+        P = self.frac * self.L
+        rn = max([R_NEAR] + [hi + 0.05 for _, hi in GAP.values()]) if GAP else R_NEAR
+        near = np.where(np.all((P >= q.min(0) - rn) & (P <= q.max(0) + rn), axis=1))[0]
+        if not len(near):
+            return out
+        P = P[near]
+        sym = np.asarray(self.sym)[near]
+        n_siO, n_cat, n_o, has_hf = (self.n_siO[near], self.n_cat[near], self.n_o[near],
+                                     self.has_hf[near])
+        diff = q[:, None, :] - P[None]
+        D = np.sqrt(np.einsum("mnk,mnk->mn", diff, diff))
+        mind = np.array([_pair(MIN_DIST, elem, x) for x in sym])
+        cut = np.array([_pair(BOND_CUTOFFS, elem, x) for x in sym])
+        bad = (D < mind).any(1)
+        B = D < cut
+        is_si, is_o, is_hf = sym == "Si", sym == "O", sym == "Hf"
+        if elem == "Si":
+            bad |= (B & (is_si | is_o)).sum(1) > MAX_SI_CN
+            bad |= (B & is_si & (n_siO + 1 > MAX_SI_CN)).any(1)
+            bad |= (B & is_o & (n_cat + 1 > np.where(has_hf, 4, 2))).any(1)
+        elif elem == "O":
+            bad |= (B & is_o).any(1)
+            bad |= (B & (is_si | is_hf)).sum(1) > np.where((B & is_hf).any(1), 4, 2)
+            bad |= (B & is_si & (n_siO + 1 > MAX_SI_CN)).any(1)
+            bad |= (B & is_hf & (n_o + 1 > MAX_HF_CN)).any(1)
+        elif elem == "Hf":
+            bad |= (B & is_o).sum(1) > MAX_HF_CN
+            bad |= (B & is_o & (n_cat + 1 > 4)).any(1)
+        if GAP:
+            for (x, y), (lo, hi) in GAP.items():
+                if elem in (x, y):
+                    other = y if elem == x else x
+                    bad |= ((D >= lo) & (D < hi) & (sym == other)[None]).any(1)
+        out[np.where(ok)[0][bad]] = True
+        return out
+
+    def bad_full(self, elem, p):
+        """reference implementation (all atoms)."""
         out = ~self.in_box(p)
         ok = ~out
         if ok.any():
@@ -182,9 +230,27 @@ def _sample(logits, allowed_ids, temperature, top_k, mask=None):
     return int(torch.multinomial(F.softmax(sub, -1), 1))
 
 
+RECORD_ACTIONS = False   # RL: record every sampled choice (allowed set + log-prob)
+
+
+def _sample_rec(guide, pos, logits, allowed_ids, temperature, top_k, mask=None):
+    """_sample + record (token, allowed token ids, log-prob) at sequence position
+    pos. The log-prob is that of the masked softmax at this temperature, exact
+    for top_k None (the RL policy)."""
+    k = _sample(logits, allowed_ids, temperature, top_k, mask)
+    if k is not None and RECORD_ACTIONS:
+        ok = torch.ones(len(allowed_ids), dtype=torch.bool) if mask is None else ~mask.cpu()
+        al = allowed_ids.cpu()[ok]
+        lsm = (logits.cpu()[al] / temperature).log_softmax(-1)
+        tok = int(allowed_ids[k])
+        guide.act[pos] = (tok, al.numpy().astype(np.int16), float(lsm[int((al == tok).nonzero()[0, 0])]))
+    return k
+
+
 def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
                max_atom_retries=20, device="cpu"):
     guide.reset()
+    guide.act = {}
     tok, zs = guide.tok, guide.zs
     ids = guide.prompt_ids()
     max_len = model.config.max_seq_len
@@ -196,8 +262,10 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
 
     while True:
         if sum(guide.remaining.values()) == 0:
+            act = [(p_, t_, al, lp) for p_, (t_, al, lp) in sorted(guide.act.items())
+                   if p_ < len(ids) and ids[p_] == t_] if RECORD_ACTIONS else None
             return True, {"retries": n_retry_total, "seeds": len(guide.needy_env()) if COMPLETE_ENV else 0,
-                          "ids": list(ids)}
+                          "ids": list(ids), "act": act}
         if seeds:
             g, e = seeds[0]
             B = (guide.directed_bins(g, e)
@@ -210,7 +278,7 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
                 lg = (yield seq)
                 m = torch.ones(len(xyz_ids[ax]), dtype=torch.bool, device=device)
                 m[torch.from_numpy(np.unique(B[:, ax])).to(device)] = False
-                kk = _sample(lg, xyz_ids[ax], temperature, top_k, m)
+                kk = _sample_rec(guide, len(seq), lg, xyz_ids[ax], temperature, top_k, m)
                 B = B[B[:, ax] == kk]
                 seq.append(int(xyz_ids[ax][kk]))
             ids = seq
@@ -232,7 +300,7 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
         else:
             opts.append(tok.jump_id)
         opts_t = torch.tensor(opts, device=device)
-        k = _sample(lg, opts_t, temperature, top_k)
+        k = _sample_rec(guide, len(ids), lg, opts_t, temperature, top_k)
         first = opts[k]
         if first == tok.next_id:
             ids.append(first); zs.next(); retries = 0
@@ -243,7 +311,7 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
             lg = (yield seq)
             tids = torch.tensor([guide.type_ids[e] for e, n in guide.remaining.items() if n > 0],
                                 device=device)
-            t = int(tids[_sample(lg, tids, temperature, top_k)])
+            t = int(tids[_sample_rec(guide, len(seq), lg, tids, temperature, top_k)])
             elem = guide.type_of[t]
             seq.append(t)
             b = []
@@ -256,7 +324,7 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
                     cz = tok.pos_of_bin(np.arange(tok.n_bins))
                     cand = np.column_stack([np.full_like(cz, cx), np.full_like(cz, cy), cz])
                     m = m | torch.from_numpy(guide.bad(elem, cand)).to(device)
-                kk = _sample(lg, xyz_ids[ax], temperature, top_k, m)
+                kk = _sample_rec(guide, len(seq), lg, xyz_ids[ax], temperature, top_k, m)
                 if kk is None:
                     break
                 b.append(kk); seq.append(int(xyz_ids[ax][kk]))
@@ -274,7 +342,7 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
         elem = guide.type_of[first]
         fr = zs.frame(f)
         seq = ids + [first]
-        kr = _sample((yield seq), r_ids, temperature, top_k)
+        kr = _sample_rec(guide, len(seq), (yield seq), r_ids, temperature, top_k)
         seq.append(int(r_ids[kr]))
         r = tok.r_val(kr)
         T, P = np.meshgrid(tok.th_val(np.arange(len(th_ids))),
@@ -282,11 +350,11 @@ def z_generate_co(model, guide: ZWindowGuide, temperature=0.8, top_k=50,
         cand = ZState.cartesian(fr, r, T.ravel(), P.ravel())
         badg = guide.bad(elem, cand).reshape(T.shape)
         th_mask = torch.from_numpy(badg.all(1)).to(device)
-        kt = _sample((yield seq), th_ids, temperature, top_k, th_mask)
+        kt = _sample_rec(guide, len(seq), (yield seq), th_ids, temperature, top_k, th_mask)
         if kt is not None:
             seq.append(int(th_ids[kt]))
-            kp = _sample((yield seq), ph_ids, temperature, top_k,
-                         torch.from_numpy(badg[kt]).to(device))
+            kp = _sample_rec(guide, len(seq), (yield seq), ph_ids, temperature, top_k,
+                             torch.from_numpy(badg[kt]).to(device))
         if kt is None or kp is None:
             retries += 1; n_retry_total += 1
             if retries > max_atom_retries:      # give up on this focus
@@ -395,6 +463,17 @@ if __name__ == "__main__":
     if "--complete_env" in sys.argv:
         sys.argv.remove("--complete_env")
         COMPLETE_ENV = True
+    TOP_K_CLI = 50
+    if "--top_k" in sys.argv:                      # 0 -> no top-k (exact RL policy)
+        k_ = sys.argv.index("--top_k"); TOP_K_CLI = int(sys.argv[k_ + 1]) or None
+        del sys.argv[k_:k_ + 2]
+    RECORD_FILE = None
+    if "--record" in sys.argv:                     # RL episode recording (python/rl/recorder.py)
+        k_ = sys.argv.index("--record"); RECORD_FILE = sys.argv[k_ + 1]
+        del sys.argv[k_:k_ + 2]
+        RECORD_ACTIONS = True
+        from rl.recorder import Recorder
+        wg.RECORDER = Recorder()
     if "--no_kv_cache" in sys.argv:
         sys.argv.remove("--no_kv_cache")
         USE_KV_CACHE = False
@@ -406,4 +485,9 @@ if __name__ == "__main__":
     main = main.replace('if __name__ == "__main__":', "if True:")
     print(f"window v2 generation, force_bonds={FORCE_BONDS}, gap_mask={GAP}, "
           f"complete_env={COMPLETE_ENV}", flush=True)
+    if TOP_K_CLI != 50:
+        import functools
+        wg.guided_generate_batch = functools.partial(z_generate_batch, top_k=TOP_K_CLI)
     exec(compile(main, wg.__file__, "exec"), vars(wg))
+    if RECORD_FILE:
+        wg.RECORDER.save(RECORD_FILE)
