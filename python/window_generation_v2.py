@@ -231,6 +231,12 @@ def _sample(logits, allowed_ids, temperature, top_k, mask=None):
 
 
 RECORD_ACTIONS = False   # RL: record every sampled choice (allowed set + log-prob)
+# classifier-free guidance on the clean/defect label: every sequence (prompted
+# Q_clean) gets a twin with Q_defect at the label slot; the next-token logits
+# are lc + CFG_W * (lc - ld). 0 = off. The RL log-probs recorded by
+# _sample_rec are then those of the guided distribution.
+CFG_W = 0.0
+Q_POS = 2                # [BOS] COMP Q ...
 
 
 def _sample_rec(guide, pos, logits, allowed_ids, temperature, top_k, mask=None):
@@ -391,17 +397,19 @@ def z_generate_batch(model, guides, temperature=0.8, top_k=50, max_atom_retries=
             pend[k] = next(g)
         except StopIteration as e:
             res[k] = e.value
+    twin = _cfg_twin(guides[0].tok) if CFG_W else None
     if USE_KV_CACHE:
-        return _drive_cached(model, gens, res, pend, device)
+        return _drive_cached(model, gens, res, pend, device, twin)
     while pend:
         ks = list(pend)
-        T = max(len(pend[k]) for k in ks)
-        x = np.zeros((len(ks), T), dtype=np.int64)
-        for r, k in enumerate(ks):
-            x[r, :len(pend[k])] = pend[k]
+        seqs = [pend[k] for k in ks] + ([twin(pend[k]) for k in ks] if twin else [])
+        T = max(len(q) for q in seqs)
+        x = np.zeros((len(seqs), T), dtype=np.int64)
+        for r, q in enumerate(seqs):
+            x[r, :len(q)] = q
         logits = model(torch.from_numpy(x).to(device))[0]
-        last = torch.tensor([len(pend[k]) - 1 for k in ks], device=device)
-        lg = logits[torch.arange(len(ks), device=device), last].float().cpu()
+        last = torch.tensor([len(q) - 1 for q in seqs], device=device)
+        lg = _cfg_mix(logits[torch.arange(len(seqs), device=device), last].float().cpu(), len(ks))
         for r, k in enumerate(ks):
             try:
                 pend[k] = gens[k].send(lg[r])
@@ -411,20 +419,40 @@ def z_generate_batch(model, guides, temperature=0.8, top_k=50, max_atom_retries=
     return res
 
 
+def _cfg_twin(tok):
+    qc, qd = tok.tid("Q_clean"), tok.tid("Q_defect")
+    def twin(seq):
+        assert seq[Q_POS] == qc, "CFG needs Q_clean prompts"
+        t = list(seq); t[Q_POS] = qd
+        return t
+    return twin
+
+
+def _cfg_mix(lg, n):
+    """rows [0, n) conditional (Q_clean), rows [n, 2n) their Q_defect twins."""
+    if len(lg) == n:
+        return lg
+    lc, ld = lg[:n], lg[n:]
+    return lc + CFG_W * (lc - ld)
+
+
 USE_KV_CACHE = True   # --no_kv_cache: recompute the full sequence every step
 
 
-def _drive_cached(model, gens, res, pend, device):
+def _drive_cached(model, gens, res, pend, device, twin=None):
     """Lock-step driver with a key-value cache. Each row keeps the tokens it
     has cached; a request that extends them feeds only the new tokens, one
-    that diverges (retry / discarded branch) rewinds to the common prefix."""
-    cache = model.alloc_cache(len(gens), device)
-    ctoks = [[] for _ in gens]
+    that diverges (retry / discarded branch) rewinds to the common prefix.
+    With CFG (twin), cache row n + k holds the Q_defect twin of row k."""
+    n = len(gens)
+    cache = model.alloc_cache(2 * n if twin else n, device)
+    ctoks = [[] for _ in range(2 * n if twin else n)]
     while pend:
         ks = list(pend)
-        starts, chunks = [], []
-        for k in ks:
-            s, c = pend[k], ctoks[k]
+        reqs = [(k, pend[k]) for k in ks] + ([(n + k, twin(pend[k])) for k in ks] if twin else [])
+        rows, starts, chunks = [], [], []
+        for row, s in reqs:
+            c = ctoks[row]
             if len(c) < len(s) and s[:len(c)] == c:
                 p = len(c)
             else:                                     # rewind
@@ -432,15 +460,16 @@ def _drive_cached(model, gens, res, pend, device):
                 while p < m and s[p] == c[p]:
                     p += 1
             p = min(p, len(s) - 1)                    # always feed >= 1 token
-            starts.append(p); chunks.append(s[p:])
-            ctoks[k] = list(s)
+            rows.append(row); starts.append(p); chunks.append(s[p:])
+            ctoks[row] = list(s)
         N = max(len(c) for c in chunks)
-        x = np.zeros((len(ks), N), dtype=np.int64)
+        x = np.zeros((len(reqs), N), dtype=np.int64)
         for r, c in enumerate(chunks):
             x[r, :len(c)] = c
-        meta = torch.tensor([ks, starts, [len(c) for c in chunks]], dtype=torch.long).to(device)
+        meta = torch.tensor([rows, starts, [len(c) for c in chunks]], dtype=torch.long).to(device)
         lg = model.forward_cached(torch.from_numpy(x).to(device), meta[0], meta[1], meta[2],
                                   cache).float().cpu()
+        lg = _cfg_mix(lg, len(ks))
         for r, k in enumerate(ks):
             try:
                 pend[k] = gens[k].send(lg[r])
@@ -477,6 +506,9 @@ if __name__ == "__main__":
     if "--no_kv_cache" in sys.argv:
         sys.argv.remove("--no_kv_cache")
         USE_KV_CACHE = False
+    if "--cfg" in sys.argv:                        # classifier-free guidance weight
+        k_ = sys.argv.index("--cfg"); CFG_W = float(sys.argv[k_ + 1])
+        del sys.argv[k_:k_ + 2]
     if "--gap_mask" in sys.argv:
         sys.argv.remove("--gap_mask")
         GAP = {("Si", "O"): (2.10, 2.55), ("Si", "Si"): (2.60, 2.85)}
@@ -484,7 +516,7 @@ if __name__ == "__main__":
     main = src[src.index('if __name__ == "__main__":'):]
     main = main.replace('if __name__ == "__main__":', "if True:")
     print(f"window v2 generation, force_bonds={FORCE_BONDS}, gap_mask={GAP}, "
-          f"complete_env={COMPLETE_ENV}", flush=True)
+          f"complete_env={COMPLETE_ENV}, cfg={CFG_W}", flush=True)
     if TOP_K_CLI != 50:
         import functools
         wg.guided_generate_batch = functools.partial(z_generate_batch, top_k=TOP_K_CLI)
