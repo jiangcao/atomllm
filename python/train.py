@@ -620,9 +620,9 @@ def train(config: GPTConfig, sequences_file: str,
         meta = json.load(f)
     val_seqs = meta.get("val_sequences")
     val_ul_loader = None
-    if ul_weight > 0:
-        assert "ul_positions" in meta and not augment_tokenizer, \
-            "--ul_weight needs ul_positions in the sequences file (window_tokenizer_v2.py), no --augment"
+    assert ul_weight == 0 or ("ul_positions" in meta and not augment_tokenizer), \
+        "--ul_weight needs ul_positions in the sequences file (window_tokenizer_v2.py), no --augment"
+    if "ul_positions" in meta and not augment_tokenizer:
         q_pos, q_clean_id = meta["q_pos"], meta["q_clean_id"]
         full_dataset = ULSequenceDataset(meta["sequences"], meta["ul_positions"],
                                          max_length=config.max_seq_len)
@@ -630,8 +630,13 @@ def train(config: GPTConfig, sequences_file: str,
         print(f"  Unlikelihood: weight {ul_weight}, {n_ul} train sequences with "
               f"{sum(map(len, meta['ul_positions']))} targets")
         if meta.get("val_ul_positions") and len(meta["val_ul_positions"]) == len(val_seqs):
+            # monitor only: val sequences that have targets (also for ul_weight 0)
+            keep = [i for i, u in enumerate(meta["val_ul_positions"]) if u]
+            keep = [keep[i] for i in np.random.default_rng(0).permutation(len(keep))]  # fixed mix
             val_ul_loader = DataLoader(
-                ULSequenceDataset(val_seqs, meta["val_ul_positions"], max_length=config.max_seq_len),
+                ULSequenceDataset([val_seqs[i] for i in keep],
+                                  [meta["val_ul_positions"][i] for i in keep],
+                                  max_length=config.max_seq_len),
                 batch_size=config.batch_size, shuffle=False, num_workers=0)
     del meta
     if val_seqs:
