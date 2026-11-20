@@ -458,5 +458,5 @@ if __name__ == "__main__":
         max_structures=args.max_structures,
         clean_only=args.clean_only)
     tokenizer.save(args.out_tokenizer)
-    print(f"\nNext: python train_llm.py --sequences {args.out_sequences} "
+    print(f"\nNext: python train.py --sequences {args.out_sequences} "
           f"--tokenizer {args.out_tokenizer}")

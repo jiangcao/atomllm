@@ -21,13 +21,13 @@ Requirements:
 
 Usage:
     # Full training
-    python train_llm.py \
+    python train.py \
         --sequences data/sequences.json \
         --tokenizer data/tokenizer.json \
         --out_dir    checkpoints/
 
     # Quick smoke test (tiny model, few steps)
-    python train_llm.py --smoke_test
+    python train.py --smoke_test
 """
 
 import os
@@ -135,6 +135,24 @@ class CausalSelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
 
+    def forward_cached(self, x, cache, rows, pos, n_keys):
+        """Incremental attention with a key-value cache (inference only).
+        x (b, N, C) new tokens of cache rows `rows` (b,); pos (b, N) their
+        positions (padding -> the dump slot, last index of the cache);
+        cache (K, V) each (B_all, H, S, d_head); keys 0..n_keys-1 are read."""
+        b, N, C = x.shape
+        q, k, v = self.qkv_proj(x).split(self.d_model, dim=2)
+        K, V = cache
+        r = rows[:, None]
+        K[r, :, pos] = k.view(b, N, self.n_heads, self.d_head)
+        V[r, :, pos] = v.view(b, N, self.n_heads, self.d_head)
+        q = q.view(b, N, self.n_heads, self.d_head).transpose(1, 2)
+        kk, vv = K[rows, :, :n_keys], V[rows, :, :n_keys]
+        qpos = pos.clamp(max=n_keys - 1)
+        allow = torch.arange(n_keys, device=x.device)[None, None, :] <= qpos[:, :, None]
+        out = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allow[:, None])
+        return self.out_proj(out.transpose(1, 2).reshape(b, N, C))
+
 
 class TransformerBlock(nn.Module):
     """Single transformer block: attention + feedforward with residuals."""
@@ -155,6 +173,10 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.ln1(x))   # pre-norm + residual
         x = x + self.ff(self.ln2(x))
         return x
+
+    def forward_cached(self, x, cache, rows, pos, n_keys):
+        x = x + self.attn.forward_cached(self.ln1(x), cache, rows, pos, n_keys)
+        return x + self.ff(self.ln2(x))
 
 
 class AtomicGPT(nn.Module):
@@ -236,6 +258,37 @@ class AtomicGPT(nn.Module):
 
         return logits, loss
 
+    # ---- key-value cache (inference) ----
+    def alloc_cache(self, n_rows: int, device=None):
+        """Per layer (K, V), each (n_rows, H, max_seq_len + 1, d_head); the
+        extra last slot is a dump for padding tokens."""
+        c, p = self.config, next(self.parameters())
+        shape = (n_rows, c.n_heads, c.max_seq_len + 1, c.d_model // c.n_heads)
+        return [(torch.zeros(shape, dtype=p.dtype, device=device or p.device),
+                 torch.zeros(shape, dtype=p.dtype, device=device or p.device))
+                for _ in self.blocks]
+
+    @torch.no_grad()
+    def forward_cached(self, new_ids, rows, start, n_new, cache):
+        """Feed the new tokens of some cache rows.
+        new_ids (b, N) right-padded new tokens, rows (b,) cache rows,
+        start (b,) number of tokens already cached in each row (all earlier
+        positions must hold that row's prefix), n_new (b,) real new tokens.
+        Returns the logits at each row's last new token, (b, vocab)."""
+        b, N = new_ids.shape
+        S = self.config.max_seq_len
+        j = torch.arange(N, device=new_ids.device)[None]
+        pos = start[:, None] + j
+        real = j < n_new[:, None]
+        assert int(pos[real].max()) < S, "sequence exceeds max_seq_len"
+        pos = torch.where(real, pos, torch.full_like(pos, S))   # dump slot
+        x = self.token_emb(new_ids) + self.pos_emb(pos.clamp(max=S - 1))
+        n_keys = int((start + n_new).max())
+        for blk, kv in zip(self.blocks, cache):
+            x = blk.forward_cached(x, kv, rows, pos, n_keys)
+        x = self.ln_final(x[torch.arange(b, device=x.device), n_new - 1])
+        return self.lm_head(x)
+
     @torch.no_grad()
     def generate(self, prompt_ids: torch.Tensor,
                  max_new_tokens: int = 400,
@@ -307,6 +360,106 @@ class AtomicSequenceDataset(torch.utils.data.Dataset):
         with open(path) as f:
             data = json.load(f)
         return cls(data["sequences"], **kwargs)
+
+
+class SymmetryAugmenter:
+    """
+    Random symmetry copy of a tokenized periodic structure, done directly on
+    the fractional coordinate bins (exact, no re-binning error):
+      * translation : b -> (b + s) mod n_bins     (any s, per axis)
+      * reflection  : b -> n_bins - 1 - b         (maps bin centres exactly)
+      * permutation : swap axes among equal cell lengths
+    Atoms are then re-ordered by cluster growing from the cell centre, as the
+    tokenizer does, so augmented sequences look like real ones.
+    Needs the vocab layout X_0..X_{n-1}, Y_0.., Z_0.. (contiguous ids).
+    """
+
+    def __init__(self, tokenizer_path: str, header_len: int = 6):
+        with open(tokenizer_path) as f:
+            tk = json.load(f)
+        t2i = tk["vocab"]["token2id"] if "vocab" in tk else tk["token2id"]
+        cfg = tk.get("config", {})
+        self.n_bins = cfg.get("n_bins", 512)
+        self.x0 = {a: t2i[f"{a}_0"] for a in "XYZ"}
+        for a in "XYZ":
+            assert t2i[f"{a}_{self.n_bins - 1}"] == self.x0[a] + self.n_bins - 1
+        self.header_len = header_len
+        self.eos = t2i["[EOS]"]
+        self.l0 = t2i["L_0"]
+        self.cell_min = cfg.get("cell_min", 5.0)
+        self.cell_res = cfg.get("cell_resolution", 0.05)
+
+    def __call__(self, seq: list, rng: np.random.Generator) -> list:
+        h = self.header_len
+        end = seq.index(self.eos) if self.eos in seq else len(seq)
+        body = np.array(seq[h:end])
+        if len(body) % 4 or len(body) == 0:
+            return seq
+        g = body.reshape(-1, 4)
+        types = g[:, 0]
+        bins = np.stack([g[:, 1 + k] - self.x0[a] for k, a in enumerate("XYZ")], 1)
+        L_tok = np.array(seq[3:6])
+        lengths = self.cell_min + (L_tok - self.l0) * self.cell_res
+
+        perm = np.arange(3)
+        for axes in ([0, 1, 2],) if len(set(L_tok)) == 1 else \
+                ([[0, 1]] if L_tok[0] == L_tok[1] else []) + \
+                ([[1, 2]] if L_tok[1] == L_tok[2] else []) + \
+                ([[0, 2]] if L_tok[0] == L_tok[2] else []):
+            axes = np.array(axes)
+            perm[axes] = perm[rng.permutation(axes)]
+            break
+        bins = bins[:, perm]
+        flip = rng.random(3) < 0.5
+        bins = np.where(flip, self.n_bins - 1 - bins, bins)
+        bins = (bins + rng.integers(0, self.n_bins, 3)) % self.n_bins
+
+        frac = (bins + 0.5) / self.n_bins
+        order = _cluster_order(frac, lengths)
+        out = np.empty((len(order), 4), dtype=np.int64)
+        out[:, 0] = types[order]
+        for k, a in enumerate("XYZ"):
+            out[:, 1 + k] = bins[order, k] + self.x0[a]
+        return list(seq[:h]) + out.ravel().tolist() + list(seq[end:])
+
+
+def _cluster_order(frac: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Cluster-growing order with minimum-image distances (as the tokenizer)."""
+    n = len(frac)
+
+    def dist(f):
+        d = frac - f
+        d -= np.round(d)
+        return np.linalg.norm(d * lengths, axis=1)
+
+    start = int(np.argmin(dist(np.full(3, 0.5))))
+    order = np.empty(n, dtype=np.int64)
+    order[0] = start
+    placed = np.zeros(n, bool)
+    placed[start] = True
+    min_d = dist(frac[start])
+    for k in range(1, n):
+        nxt = int(np.argmin(np.where(placed, np.inf, min_d)))
+        order[k] = nxt
+        placed[nxt] = True
+        min_d = np.minimum(min_d, dist(frac[nxt]))
+    return order
+
+
+class AugmentedSequenceDataset(AtomicSequenceDataset):
+    """AtomicSequenceDataset that returns a fresh random symmetry copy each time."""
+
+    def __init__(self, sequences, augmenter: SymmetryAugmenter, **kwargs):
+        super().__init__(sequences, **kwargs)
+        self.augmenter = augmenter
+
+    def __getitem__(self, idx):
+        rng = np.random.default_rng()
+        seq = self.augmenter(self.sequences[idx], rng)
+        seq = seq[:self.max_length + 1]
+        padded = seq + [self.pad_id] * (self.max_length + 1 - len(seq))
+        return (torch.tensor(padded[:-1], dtype=torch.long),
+                torch.tensor(padded[1:], dtype=torch.long))
 
 
 # ============================================================
@@ -392,7 +545,11 @@ def load_checkpoint(path: str, device: str = "cpu"):
 # ============================================================
 
 def train(config: GPTConfig, sequences_file: str,
-          out_dir: str = "checkpoints", device: str = "auto"):
+          out_dir: str = "checkpoints", device: str = "auto",
+          augment_tokenizer: Optional[str] = None, num_workers: int = 0,
+          init_checkpoint: Optional[str] = None):
+    """augment_tokenizer: tokenizer.json path -> random symmetry augmentation
+    of the training split (validation stays un-augmented)."""
 
     # Device
     if device == "auto":
@@ -404,23 +561,42 @@ def train(config: GPTConfig, sequences_file: str,
     full_dataset = AtomicSequenceDataset.from_file(
         sequences_file, max_length=config.max_seq_len
     )
-    n_total = len(full_dataset)
-    n_val   = max(int(0.05 * n_total), 100)
-    n_train = n_total - n_val
-
-    train_set, val_set = random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    with open(sequences_file) as f:
+        val_seqs = json.load(f).get("val_sequences")
+    if val_seqs:
+        # Pre-split (e.g. window crops, held out by MD run)
+        train_set = full_dataset
+        val_set = AtomicSequenceDataset(val_seqs, max_length=config.max_seq_len)
+        n_train, n_val = len(train_set), len(val_set)
+    else:
+        n_total = len(full_dataset)
+        n_val   = max(int(0.05 * n_total), 100)
+        n_train = n_total - n_val
+        train_set, val_set = random_split(
+            full_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42)
+        )
     print(f"  Train: {n_train}  |  Val: {n_val}")
+    if augment_tokenizer:
+        aug_ds = AugmentedSequenceDataset(full_dataset.sequences,
+                                          SymmetryAugmenter(augment_tokenizer),
+                                          max_length=config.max_seq_len)
+        train_set = torch.utils.data.Subset(aug_ds, train_set.indices)
+        print("  Augmentation: random translation / reflection / axis permutation")
 
     train_loader = DataLoader(train_set, batch_size=config.batch_size,
-                              shuffle=True,  num_workers=0, pin_memory=True)
+                              shuffle=True, num_workers=num_workers,
+                              pin_memory=True, persistent_workers=num_workers > 0)
     val_loader   = DataLoader(val_set,   batch_size=config.batch_size,
                               shuffle=False, num_workers=0)
 
     # Model
     model = AtomicGPT(config).to(device)
+    if init_checkpoint:
+        # warm start (fine-tuning on new data with the same tokenizer/architecture)
+        ckpt = torch.load(init_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"  Initialised from {init_checkpoint} (val_loss={ckpt['val_loss']:.4f})")
 
     # Optimizer (AdamW with weight decay on non-bias/norm params)
     decay_params     = [p for n, p in model.named_parameters()
@@ -483,7 +659,8 @@ def train(config: GPTConfig, sequences_file: str,
 
             # Periodic checkpoint
             if step % config.save_every == 0:
-                save_checkpoint(model, optimizer, step, epoch_loss / step, out_dir)
+                save_checkpoint(model, optimizer, step,
+                                epoch_loss / (step - epoch * len(train_loader)), out_dir)
 
         dt = time.time() - t0
         avg_loss = epoch_loss / len(train_loader)
@@ -606,6 +783,15 @@ if __name__ == "__main__":
     parser.add_argument("--n_heads",    type=int,   default=8)
     parser.add_argument("--max_epochs", type=int,   default=50)
     parser.add_argument("--batch_size", type=int,   default=32)
+    parser.add_argument("--lr",         type=float, default=3e-4)
+    parser.add_argument("--max_seq_len", type=int,  default=520,
+                        help="Context length; sequences are padded to it")
+    parser.add_argument("--dropout",    type=float, default=0.1)
+    parser.add_argument("--augment",    action="store_true",
+                        help="Random translation/reflection/axis-permutation copies "
+                             "of each training structure every epoch")
+    parser.add_argument("--num_workers", type=int,  default=4,
+                        help="DataLoader workers (used with --augment)")
     parser.add_argument("--smoke_test", action="store_true",
                         help="Quick test with tiny model + synthetic data")
     parser.add_argument("--generate",   action="store_true",
@@ -614,6 +800,8 @@ if __name__ == "__main__":
                         help="Checkpoint path for generation")
     parser.add_argument("--composition", default="SiO2",
                         help="Composition for generation: SiO2, HfO2, HfSiO4")
+    parser.add_argument("--init_checkpoint", default=None,
+                        help="Warm start from this checkpoint (same vocab/architecture)")
     parser.add_argument("--n_atoms",    type=int,   default=72)
     parser.add_argument("--n_samples",  type=int,   default=10)
     parser.add_argument("--max_tries",  type=int,   default=100)
@@ -670,7 +858,14 @@ if __name__ == "__main__":
             n_layers=args.n_layers,
             d_model=args.d_model,
             n_heads=args.n_heads,
+            d_ff=4 * args.d_model,
+            max_seq_len=args.max_seq_len,
+            dropout=args.dropout,
+            lr=args.lr,
             max_epochs=args.max_epochs,
             batch_size=args.batch_size,
         )
-        train(config, args.sequences, out_dir=args.out_dir, device=args.device)
+        train(config, args.sequences, out_dir=args.out_dir, device=args.device,
+              augment_tokenizer=args.tokenizer if args.augment else None,
+              num_workers=args.num_workers if args.augment else 0,
+              init_checkpoint=args.init_checkpoint)
